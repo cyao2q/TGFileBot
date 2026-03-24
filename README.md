@@ -30,10 +30,10 @@ TGBot 是一个 Telegram Bot 和 UserBot 结合的项目，旨在提供文件直
   "port": 8080,               // 程序运行的 HTTP 端口
   "id": 0,                    // Telegram API ID
   "hash": "",                 // Telegram API Hash
-  "site": "http://your_domain_or_ip", // 反代域名，用于生成直链
+  "site": "",                 // 反代域名，用于生成直链
   "phone": "",                // User Bot 身份对应的手机号 (带国际区号，例如: +8613800138000)
   "botToken": "",             // 接收/phone等命令的Bot Token
-  "password": "",             // 访问/link的密码 (可选)
+  "password": "",             // 浏览器访问授权密码 (可选)
   "userID": 0,                // User Bot 身份对应的账号ID (用于判断是否为管理员，建议填写UserBot的ID)
   "adminIDs": [],             // 支持多管理员的ID列表 (填写Telegram用户ID)
   "whiteIDs": []              // 支持多白名单的ID列表 (可选，用于限制/stream访问)
@@ -49,13 +49,22 @@ TGBot 是一个 Telegram Bot 和 UserBot 结合的项目，旨在提供文件直
 - `adminIDs` 可以填写多个管理员的 Telegram 用户 ID。
 - `password` 是可选的，如果设置，访问 `/stream` 和 `/link` 接口需要携带 `key` 参数。
 
-### 4. 运行项目
+### 4. 命令行参数
+
+程序支持通过命令行参数进行配置：
+
+- `-files`: 指定配置和数据文件的存放目录（默认为 `files`）。该目录下应包含 `config.json`，程序运行产生的 `session` 和 `cache` 文件也会存放在此目录中。
+
+### 5. 运行项目
 
 #### 本地运行
 
 ```bash
 go mod tidy
-go run main.go -files files
+# 默认使用当前目录下的 files 文件夹
+go run main.go
+# 或者指定其它文件夹
+go run main.go -files my_config_dir
 ```
 
 #### Docker 部署

@@ -1,12 +1,21 @@
 version: '3.8'
+
 services:
   tgfilebot:
+    build:
+      context: .
+      dockerfile: Dockerfile
     image: lm317379829/tgfilebot:latest
+    container_name: tgfilebot
     restart: unless-stopped
     ports:
-      - "9981:9981"
+      - "9981:8080"
     volumes:
       - ./files:/root/files
-    env_file:
-      - ./files/.env
-
+    environment:
+      - TZ=Asia/Shanghai
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

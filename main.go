@@ -294,6 +294,9 @@ func handleBotCommand(m *telegram.NewMessage) error {
 	text := strings.TrimSpace(m.Text())
 	if !isAdmin(m.SenderID()) {
 		log.Printf("收到非管理员消息: %d", m.SenderID())
+		if _, err := m.Reply("你没有使用此机器人的权限"); err != nil {
+			log.Printf("发送消息失败: %+v", err)
+		}
 		return nil
 	}
 
@@ -402,6 +405,14 @@ func handleBotCommand(m *telegram.NewMessage) error {
 
 // handleM 处理接收到的新消息，解析其中的媒体文件或 tg 链接
 func handleMess(m *telegram.NewMessage) error {
+	if !isAdmin(m.SenderID()) {
+		log.Printf("收到非管理员消息: %d", m.SenderID())
+		if _, err := infos.BotClient.SendMessage(infos.Conf.UserID, "你没有使用此机器人的权限"); err != nil {
+			log.Printf("发送消息失败: %+v", err)
+		}
+		return nil
+	}
+
 	// 如果是用户发送或转发来的、带有图片/文档/视频的消息，直接生成直链
 	if m.IsMedia() && (m.Photo() != nil || m.Document() != nil || m.Video() != nil) {
 		link := fmt.Sprintf("%s/stream?cid=%d&mid=%d&cate=bot", strings.TrimSuffix(infos.Conf.Site, "/"), m.ChatID(), m.ID)
