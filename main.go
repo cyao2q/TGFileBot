@@ -844,7 +844,7 @@ func hackLink(matches [][]string, m *telegram.NewMessage) (links []string) {
 		}
 
 		// 为媒体文件构造下载直链
-		link := fmt.Sprintf("%s/stream?cid=%v&mid=%d&cate=user", strings.TrimSuffix(infos.Conf.Site, "/"), src.ChatID(), src.ID, infos.Conf.Password)
+		link := fmt.Sprintf("%s/stream?cid=%v&mid=%d&cate=user", strings.TrimSuffix(infos.Conf.Site, "/"), src.ChatID(), src.ID)
 		if infos.Conf.Password != "" {
 			link += fmt.Sprintf("&key=%s", infos.Conf.Password)
 		}
