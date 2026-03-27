@@ -22,7 +22,6 @@ import (
 	"syscall"       // 用于处理操作系统信号
 	"time"          // 用于处理时间相关逻辑
 
-	mtproto "github.com/amarnathcjd/gogram"  // 导入 gogram 的 MTProto 协议核心库
 	"github.com/amarnathcjd/gogram/telegram" // 导入 gogram 客户端核心库
 )
 
@@ -34,17 +33,16 @@ type CleanRealm struct {
 }
 
 type Infos struct {
-	BotClient  *telegram.Client         // 独立的 Bot 客户端（可选）
-	UserClient *telegram.Client         // 全局 Telegram 客户端实例
-	Client     *telegram.Client         // 当前客户端实例
-	Mutex      *sync.Mutex              // 并发锁
-	Conf       *Conf                    // 全局配置指针
-	HasNew     bool                     // 是否有新配置
-	FilesPath  string                   // 配置目录路径
-	LogPath    string                   // 日志文件路径
-	UserHash   string                   // 验证码所需的登录Hash
-	BotID      int64                    // Bot 的 ID
-	Senders    map[int]*mtproto.MTProto // 独立的 Bot 客户端
+	BotClient  *telegram.Client // 独立的 Bot 客户端（可选）
+	UserClient *telegram.Client // 全局 Telegram 客户端实例
+	Client     *telegram.Client // 当前客户端实例
+	Mutex      *sync.Mutex      // 并发锁
+	Conf       *Conf            // 全局配置指针
+	HasNew     bool             // 是否有新配置
+	FilesPath  string           // 配置目录路径
+	LogPath    string           // 日志文件路径
+	UserHash   string           // 验证码所需的登录Hash
+	BotID      int64            // Bot 的 ID
 }
 
 var infos Infos
@@ -102,12 +100,6 @@ func main() {
 	}
 	if infos.Mutex == nil {
 		infos.Mutex = new(sync.Mutex)
-	}
-
-	if infos.Senders == nil {
-		infos.Mutex.Lock()
-		infos.Senders = make(map[int]*mtproto.MTProto)
-		infos.Mutex.Unlock()
 	}
 	infos.Mutex.Lock()
 	infos.FilesPath = *files
@@ -198,7 +190,7 @@ func main() {
 				}
 			}
 			log.Printf("UserBot 启动失败: %+v", err)
-			sigChan <- os.Interrupt
+			// sigChan <- os.Interrupt
 		}
 	}
 
@@ -260,6 +252,9 @@ func startUserBot() error {
 		Session:      filepath.Join(infos.FilesPath, "user.session"),
 		Cache:        telegram.NewCache(filepath.Join(infos.FilesPath, "user.cache")),
 		CacheSenders: true,
+	}
+	if infos.Conf.DC != 0 {
+		userConf.DataCenter = infos.Conf.DC
 	}
 
 	client, err := telegram.NewClient(userConf)
@@ -343,7 +338,9 @@ func handleMain(w http.ResponseWriter, r *http.Request) {
 		// 2. 打开日志文件
 		file, err := os.Open(infos.LogPath)
 		if err != nil {
-			fmt.Fprintf(w, "无法打开日志文件: %v\n", err)
+			if _, err := fmt.Fprintf(w, "无法打开日志文件: %v\n", err); err != nil {
+				log.Printf("发送网页失败: %+v", err)
+			}
 			return
 		}
 		defer func() {
@@ -360,13 +357,17 @@ func handleMain(w http.ResponseWriter, r *http.Request) {
 			case <-ctx.Done():
 				return
 			default:
-				fmt.Fprintf(w, "%s\n", scanner.Text())
+				if _, err := fmt.Fprintf(w, "%s\n", scanner.Text()); err != nil {
+					log.Printf("发送网页失败: %+v", err)
+				}
 				flusher.Flush()
 			}
 		}
 		if err := scanner.Err(); err != nil {
 			log.Printf("读取文件时发生错误: %v", err)
-			fmt.Fprintf(w, "\n[服务器端读取错误: %v]\n", err)
+			if _, err := fmt.Fprintf(w, "\n[服务器端读取错误: %v]\n", err); err != nil {
+				log.Printf("发送网页失败: %+v", err)
+			}
 		}
 	case strings.HasPrefix(path, "/link"):
 		handleLink(w, r)
@@ -392,9 +393,42 @@ func handlePhone() error {
 					log.Printf("无法提取新的 DC, 跳过重试")
 					continue
 				}
-				if err := infos.UserClient.SwitchDc(newDC); err != nil {
-					log.Printf("切换 DC 失败: %v", err)
+
+				if infos.UserClient != nil {
+					err = infos.UserClient.Disconnect()
+					if err != nil {
+						log.Printf("断开 UserClient 连接失败: %v", err)
+					}
+					time.Sleep(1 * time.Second)
 				}
+
+				cleanFiles(CleanRealm{Cate: "user", Realm: "session"})
+				cleanFiles(CleanRealm{Cate: "user", Realm: "cache", Filter: false})
+
+				userConf := telegram.ClientConfig{
+					AppID:        infos.Conf.AppID,
+					AppHash:      infos.Conf.AppHash,
+					LogLevel:     telegram.LogError,
+					DataCenter:   newDC,
+					Session:      filepath.Join(infos.FilesPath, "user.session"),
+					Cache:        telegram.NewCache(filepath.Join(infos.FilesPath, "user.cache")),
+					CacheSenders: true,
+				}
+				newClient, err := telegram.NewClient(userConf)
+				if err != nil {
+					log.Printf("重建 UserBot 客户端失败: %+v", err)
+					continue
+				}
+				if err := newClient.Connect(); err != nil {
+					log.Printf("重建 UserBot 连接失败: %+v", err)
+					continue
+				}
+				infos.Mutex.Lock()
+				infos.UserClient = newClient
+				infos.UserHash = ""
+				infos.Mutex.Unlock()
+				log.Printf("UserBot 切换至 %d DC 成功, 等待 6 秒后重试", newDC)
+				time.Sleep(6 * time.Second)
 				continue
 			}
 			if _, err := infos.BotClient.SendMessage(infos.Conf.UserID, "发送验证码失败: "+err.Error()); err != nil {
@@ -527,15 +561,6 @@ func handleBotCommand(m *telegram.NewMessage) error {
 
 		if infos.UserClient == nil {
 			return startUserBot()
-			/*
-				if err != nil {
-					_, err := m.Reply("UserBot 启动失败: " + err.Error())
-					if err != nil {
-						log.Printf("发送消息失败: %+v", err)
-					}
-					return err
-				}
-			*/
 		} else {
 			return handlePhone()
 		}
@@ -557,7 +582,12 @@ func handleBotCommand(m *telegram.NewMessage) error {
 			return nil
 		}
 
-		if infos.Conf.Phone == "" || infos.UserHash == "" {
+		infos.Mutex.Lock()
+		phone := infos.Conf.Phone
+		userHash := infos.UserHash
+		infos.Mutex.Unlock()
+
+		if phone == "" || userHash == "" {
 			if _, err := m.Reply("请先发送 /phone 手机号"); err != nil {
 				log.Printf("发送消息失败: %+v", err)
 			}
@@ -572,7 +602,7 @@ func handleBotCommand(m *telegram.NewMessage) error {
 			return errors.New("userBot 客户端未就绪")
 		}
 
-		if _, err := infos.UserClient.AuthSignIn(infos.Conf.Phone, infos.UserHash, code, nil); err != nil {
+		if _, err := infos.UserClient.AuthSignIn(phone, userHash, code, nil); err != nil {
 			if _, err := m.Reply("登录失败: " + err.Error()); err != nil {
 				log.Printf("发送消息失败: %+v", err)
 			}
@@ -732,18 +762,12 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 通过 gogram 获取媒体文件的位置信息及详细数据
-	loc, dc, size, fileName, err := telegram.GetFileLocation(src.Media(), telegram.FileLocationOptions{})
-	if err != nil {
-		log.Printf("获取文件位置失败: cid=%d, mid=%d, err=%v", cid, mid, err)
-		http.Error(w, fmt.Sprintf("获取文件位置失败: cid=%d, mid=%d, err=%v", cid, mid, err), http.StatusInternalServerError)
-		return
-	}
-	log.Printf("开始推流: cid=%d, mid=%d, file=%s, size=%d, dc=%d", cid, mid, fileName, size, dc)
+	stream := newStream(r.Context(), infos.Client, src.Media(), mid, cid)
+	fileName := src.File.Name
+	size := src.File.Size
 
 	w.Header().Set("Accept-Ranges", "bytes")
-	mimeType := handleMediaCate(fileName)
-	w.Header().Set("Content-Type", mimeType)
+	w.Header().Set("Content-Type", handleMediaCate(fileName))
 
 	disposition := "inline"
 	if r.URL.Query().Get("download") == "true" {
@@ -762,9 +786,15 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 	} else {
 		matches := regexp.MustCompile(`bytes= *([0-9]+) *- *([0-9]*)`).FindStringSubmatch(rangeHeader)
 		if matches != nil {
-			start, _ = strconv.ParseInt(matches[1], 10, 64)
+			start, err = strconv.ParseInt(matches[1], 10, 64)
+			if err != nil {
+				start = 0
+			}
 			if matches[2] != "" {
-				end, _ = strconv.ParseInt(matches[2], 10, 64)
+				end, err = strconv.ParseInt(matches[2], 10, 64)
+				if err != nil {
+					end = size - 1
+				}
 			} else {
 				end = size - 1
 			}
@@ -784,18 +814,46 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusPartialContent)
 	}
 
-	if r.Method != http.MethodHead {
-		reader := newReader(r.Context(), infos.Client, loc, dc, start, end, end-start+1, cid, mid, cate)
-		defer func() {
-			err := reader.Close()
-			if err != nil {
-				log.Printf("关闭 telegram reader 失败: %v", err)
+	stream.ContentSize = end - start + 1
+	go stream.start(start, end)
+	defer stream.clean()
+
+	if r.Method == http.MethodGet {
+		for {
+			select {
+			case <-r.Context().Done():
+				log.Printf("流式传输文件时已取消: cid=%d, mid=%d", cid, mid)
+				return
+			case task := <-stream.Tasks:
+				if task == nil {
+					log.Printf("流式传输文件时出错: cid=%d, mid=%d, err=任务为空", cid, mid)
+					continue
+				}
+				task.Cond.L.Lock()
+				for !*task.Done {
+					task.Cond.Wait()
+				}
+				task.Cond.L.Unlock()
+				if task.Error != nil {
+					log.Printf("流式传输文件时出错: cid=%d, mid=%d, err=%v", cid, mid, task.Error)
+					return
+				}
+				if _, err := w.Write(*task.Content); err != nil {
+					log.Printf("写入文件流时出错: cid=%d, mid=%d, err=%v", cid, mid, err)
+				}
+
+				// 判断是否下载完成
+				if task.ContentEnd >= end {
+					log.Printf("流式传输文件已完成: cid=%d, mid=%d", cid, mid)
+					return
+				}
+				task = nil
 			}
-		}()
-		_, err := io.CopyN(w, reader, end-start+1)
-		if err != nil && err != io.EOF {
-			log.Printf("流式传输文件时出错: %v", err)
 		}
+
+	} else {
+		http.Error(w, fmt.Sprintf("不支持的请求方法: %s", r.Method), http.StatusMethodNotAllowed)
+		return
 	}
 }
 
@@ -956,25 +1014,24 @@ func sendLink(m *telegram.NewMessage, link string) error {
 func cleanFiles(realm CleanRealm) {
 	switch strings.ToLower(realm.Realm) {
 	case "cache":
-		if realm.ID != "" && realm.ID != "0" {
-			if files, err := os.ReadDir(infos.FilesPath); err == nil {
-				src := fmt.Sprintf("%s_", strings.ToLower(realm.Cate))
-				for _, file := range files {
-					name := strings.TrimSpace(file.Name())
-					if !file.IsDir() && strings.HasPrefix(name, src) && strings.HasSuffix(name, ".cache") {
-						if realm.Filter {
-							currentID := strings.TrimSuffix(strings.TrimPrefix(name, src), ".cache")
-							if currentID != realm.ID {
-								err := os.Remove(filepath.Join(infos.FilesPath, name))
-								if err != nil {
-									log.Printf("删除缓存文件失败: %v", err)
-								}
-							}
-						} else {
+
+		if files, err := os.ReadDir(infos.FilesPath); err == nil {
+			src := fmt.Sprintf("%s_", strings.ToLower(realm.Cate))
+			for _, file := range files {
+				name := strings.TrimSpace(file.Name())
+				if !file.IsDir() && strings.HasPrefix(name, src) && strings.HasSuffix(name, ".cache") {
+					if realm.Filter && realm.ID != "" && realm.ID != "0" {
+						currentID := strings.TrimSuffix(strings.TrimPrefix(name, src), ".cache")
+						if currentID != realm.ID {
 							err := os.Remove(filepath.Join(infos.FilesPath, name))
 							if err != nil {
 								log.Printf("删除缓存文件失败: %v", err)
 							}
+						}
+					} else {
+						err := os.Remove(filepath.Join(infos.FilesPath, name))
+						if err != nil {
+							log.Printf("删除缓存文件失败: %v", err)
 						}
 					}
 				}

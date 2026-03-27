@@ -3,384 +3,236 @@ package main
 import (
 	"context"
 	"fmt"
-	"io"
 	"log"
-	"strings"
+	"math"
+	"regexp"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	mtproto "github.com/amarnathcjd/gogram"
 	"github.com/amarnathcjd/gogram/telegram"
 )
 
-type Reader struct {
-	Ctx           context.Context
-	Cancel        context.CancelFunc
-	Client        *telegram.Client
-	Location      telegram.InputFileLocation
-	DC            int32
-	Start         int64
-	End           int64
-	ChunkSize     int64
-	ContentLength int64
-	ChannelID     int64
-	MessageID     int32
-	Cate          string
-	Buffers       chan []byte
-	Errs          chan error
-	CurrBuffer    []byte
-	Pos           int
-	ReadBytes     int64
-	Refreshing    bool
-	Cond          *sync.Cond
-	Version       atomic.Int64
-	Once          sync.Once
-	Mutex         sync.Mutex
-	LastRefresh   time.Time // 记录上次刷新时间，避免刷新过于频繁
+type Task struct {
+	Offset       int64      // 任务偏移
+	ContentStart int64      // 任务起点
+	ContentEnd   int64      // 任务终点
+	Version      int64      // 版本号
+	Error        error      // 错误
+	Done         *bool      // 当前任务完成
+	Cond         *sync.Cond // 条件变量
+	Content      *[]byte    // 任务内容
 }
 
-func (reader *Reader) Close() error {
-	if reader.Cancel != nil {
-		reader.Cancel()
+type Stream struct {
+	Ctx          context.Context        // 上下文
+	Client       *telegram.Client       // 客户端
+	Src          *telegram.MessageMedia // 消息媒体
+	MID          int32                  // 消息ID
+	CID          int64                  // 频道ID
+	ChunkSize    int64                  // 任务块大小
+	ContentSize  int64                  // 内容大小
+	MaxCacheSize int64                  // 缓存最大值
+	TaskStart    *int64                 // 任务起点
+	TaskEnd      *int64                 // 任务终点
+	Error        error                  // 错误
+	Count        atomic.Int64           // 任务数量
+	Version      atomic.Int64           // 版本号
+	Mutex        *sync.Mutex            // 互斥锁
+	Rex          *regexp.Regexp         // 正则表达式
+	Tasks        chan *Task             // 任务队列
+}
+
+func newTask() *Task {
+	return &Task{
+		Error:   nil,
+		Done:    new(bool),
+		Content: new([]byte),
+		Cond:    sync.NewCond(new(sync.Mutex)),
 	}
-	return nil
 }
 
-func newReader(
-	ctx context.Context,
-	client *telegram.Client,
-	location telegram.InputFileLocation,
-	dc int32,
-	start int64,
-	end int64,
-	contentLength int64,
-	channelID int64,
-	messageID int32,
-	cate string,
-) io.ReadCloser {
-	ctx, cancel := context.WithCancel(ctx)
-	reader := &Reader{
-		Ctx:           ctx,
-		Cancel:        cancel,
-		Client:        client,
-		Location:      location,
-		DC:            dc,
-		Start:         start,
-		End:           end,
-		ChunkSize:     int64(1024 * 1024),
-		ContentLength: contentLength,
-		ChannelID:     channelID,
-		MessageID:     messageID,
-		Cate:          cate,
-		Buffers:       make(chan []byte, 8), // Buffer up to 8MB
-		Errs:          make(chan error, 1),
-		Cond:          sync.NewCond(new(sync.Mutex)),
+func newStream(ctx context.Context, client *telegram.Client, media telegram.MessageMedia, mid int32, cid int64) *Stream {
+	return &Stream{
+		Ctx:          ctx,
+		Client:       client,
+		Src:          &media,
+		MID:          mid,
+		CID:          cid,
+		ChunkSize:    512 * 1024,
+		MaxCacheSize: 32 * 1024 * 1024,
+		Tasks:        make(chan *Task, 256),
+		Mutex:        new(sync.Mutex),
+		TaskStart:    new(int64),
+		TaskEnd:      new(int64),
+		Rex:          regexp.MustCompile(`(\d+).*?seconds`),
+		Count:        atomic.Int64{},
+		Version:      atomic.Int64{},
 	}
-	return reader
 }
 
-func (reader *Reader) startFetching() {
-	go func() {
-		defer close(reader.Buffers)
+func (stream *Stream) start(contentStart, contentEnd int64) {
+	maxTasks := int(math.Ceil(float64(stream.ContentSize) / float64(stream.ChunkSize)))
+	if maxTasks > infos.Conf.Workers {
+		maxTasks = infos.Conf.Workers
+	}
+	if infos.Conf.Workers == 1 {
+		stream.ChunkSize = 1024 * 1024
+	}
 
-		workers := infos.Conf.Workers
-		if workers == 0 {
-			workers = 1
-		}
-		type task struct {
-			index  int
-			offset int64
-		}
-		type result struct {
-			content []byte
-			index   int
-			err     error
-		}
-
-		tasks := make(chan task, workers)
-		results := make(chan result, workers)
-
-		// Start workers
-		for count := 0; count < workers; count++ {
-			go func() {
-				for t := range tasks {
-					content, err := reader.fetchChunk(t.offset)
-					select {
-					case results <- result{index: t.index, content: content, err: err}:
-						// 成功发送结果
-					case <-reader.Ctx.Done():
-						return
-					}
-				}
-			}()
-		}
-
-		totalChunks := int((reader.End - (reader.Start - (reader.Start % reader.ChunkSize)) + reader.ChunkSize) / reader.ChunkSize)
-		if reader.End < reader.Start {
-			totalChunks = 0
-		}
-
+	for numTask := 1; numTask <= maxTasks; numTask++ {
+		stream.Count.Add(1)
 		go func() {
-			defer close(tasks)
-			startOffset := reader.Start - (reader.Start % reader.ChunkSize)
-			for count := 0; count < totalChunks; count++ {
-				select {
-				case tasks <- task{index: count, offset: startOffset + int64(count)*reader.ChunkSize}:
-					// 成功发送任务
-				case <-reader.Ctx.Done():
-					return
-				}
-			}
+			defer stream.Count.Add(-1)
+			stream.download(contentStart, contentEnd)
 		}()
-
-		// Collector
-		contents := make(map[int][]byte)
-		nextIndex := 0
-		for nextIndex < totalChunks {
-			select {
-			case res := <-results:
-				if res.err != nil {
-					select {
-					case reader.Errs <- res.err:
-						// 成功发送错误
-					default:
-					}
-					return
-				}
-				contents[res.index] = res.content
-				for {
-					content, ok := contents[nextIndex]
-					if !ok {
-						break
-					}
-
-					// Handle cuts for first and last chunks
-					switch {
-					case totalChunks == 1:
-						firstCut := reader.Start % reader.ChunkSize
-						lastCut := (reader.End % reader.ChunkSize) + 1
-						if int64(len(content)) > lastCut {
-							content = content[:lastCut]
-						}
-						if int64(len(content)) > firstCut {
-							content = content[firstCut:]
-						} else {
-							content = []byte{}
-						}
-					case nextIndex == 0:
-						firstCut := reader.Start % reader.ChunkSize
-						if int64(len(content)) > firstCut {
-							content = content[firstCut:]
-						} else {
-							content = []byte{}
-						}
-					case nextIndex == totalChunks-1:
-						lastCut := (reader.End % reader.ChunkSize) + 1
-						if int64(len(content)) > lastCut {
-							content = content[:lastCut]
-						}
-					}
-
-					if len(content) > 0 {
-						select {
-						case reader.Buffers <- content:
-							// 成功发送数据
-						case <-reader.Ctx.Done():
-							return
-						}
-					}
-					delete(contents, nextIndex)
-					nextIndex++
-				}
-			case <-reader.Ctx.Done():
-				return
-			}
-		}
-	}()
+	}
 }
 
-func (reader *Reader) fetchChunk(offset int64) (content []byte, err error) {
-	for count := 0; count < 3; count++ {
-		select {
-		case <-reader.Ctx.Done():
-			return nil, fmt.Errorf("canceled")
-		default:
-		}
-		reader.Mutex.Lock()
-		loc := reader.Location
-		version := reader.Version.Load()
-		targetDC := int(reader.DC)
-		reader.Mutex.Unlock()
-
-		params := &telegram.UploadGetFileParams{
-			Location: loc,
-			Offset:   offset,
-			Limit:    int32(reader.ChunkSize),
-		}
-
-		var res any
-
-		if targetDC != 0 {
-			infos.Mutex.Lock()
-			if infos.Senders == nil {
-				infos.Senders = make(map[int]*mtproto.MTProto)
-			}
-			sender, ok := infos.Senders[targetDC]
-
-			if ok {
-				res, err = sender.MakeRequest(params)
-				infos.Mutex.Unlock()
-			} else {
-				// 尝试创建一个导出授权的 Sender
-				newSender, serr := reader.Client.CreateExportedSender(targetDC, false)
-				if serr == nil {
-					infos.Senders[targetDC] = newSender
-					log.Printf("成功创建 DC %d 的导出 Sender", targetDC)
-					res, err = newSender.MakeRequest(params)
-				} else {
-					log.Printf("创建 DC %d 的导出 Sender 失败: %v, 将回退到主客户端", targetDC, serr)
-					res, err = reader.Client.UploadGetFile(params)
-				}
-				infos.Mutex.Unlock()
-			}
+func (stream *Stream) download(contentStart, contentEnd int64) {
+	for {
+		start := time.Now()
+		stream.Mutex.Lock()
+		task := newTask()
+		if *stream.TaskStart == 0 {
+			task.ContentStart = contentStart
 		} else {
-			res, err = reader.Client.UploadGetFile(params)
+			task.ContentStart = *stream.TaskStart
+		}
+		task.Offset = task.ContentStart - (task.ContentStart/stream.ChunkSize)*stream.ChunkSize
+		task.ContentStart = task.ContentStart - task.Offset
+		task.ContentEnd = task.ContentStart + stream.ChunkSize - 1
+
+		if task.ContentStart > contentEnd {
+			stream.Mutex.Unlock()
+			return
 		}
 
-		if err != nil {
-			// 如果是文件引用过期, 通过版本号合并并发刷新请求
-			if (strings.Contains(err.Error(), "FILE_REFERENCE") || strings.Contains(err.Error(), "EXPIRED")) &&
-				reader.ChannelID != 0 && reader.MessageID != 0 {
-				log.Printf("获取分片失败提示引用过期 (%d/3), 尝试刷新消息: %v", count+1, err)
-				if refreshed, wait := reader.refresh(version); refreshed {
-					// 刷新成功或有其他 worker 刷新，等待指定时间后重试
-					if wait > 0 {
-						time.Sleep(wait)
+		select {
+		case <-stream.Ctx.Done():
+			stream.Mutex.Unlock()
+			return
+		default:
+			select {
+			case <-stream.Ctx.Done():
+				stream.Mutex.Unlock()
+				return
+			case stream.Tasks <- task:
+				// 成功发送任务
+			default:
+				// 任务队列已满
+				log.Printf("任务队列已满: cid=%d, mid=%d", stream.CID, stream.MID)
+				stream.Tasks <- task
+			}
+		}
+		// 更新任务起点和终点
+		*stream.TaskStart = task.ContentEnd + 1
+		*stream.TaskEnd = *stream.TaskStart + stream.ChunkSize - 1
+		stream.Mutex.Unlock()
+
+		for num := 1; num <= 3; num++ {
+			version := stream.Version.Load()
+			content, fileName, err := stream.Client.DownloadChunk(*stream.Src, int(task.ContentStart), int(task.ContentEnd), int(stream.ChunkSize))
+			if err != nil {
+				switch {
+				case telegram.MatchError(err, "FILE_REFERENCE_EXPIRED"):
+					// 4. 检测 FILE_REFERENCE_EXPIRED 错误，重试
+					log.Printf("文件引用已过期: cid=%d, mid=%d, version=%d", stream.CID, stream.MID, version)
+					stream.refresh(version)
+					continue
+				case telegram.MatchError(err, "_WAIT"):
+					// 5. 检测 FLOOD_WAIT 错误，等待指定时间后重试
+					wait := 3
+					match := stream.Rex.FindStringSubmatch(err.Error())
+					if len(match) > 1 {
+						wait, err = strconv.Atoi(match[1])
+						if err != nil {
+							log.Printf("解析等待时间失败: cid=%d, mid=%d, version=%d, err=%v", stream.CID, stream.MID, version, err)
+						}
 					}
+					log.Printf("下载太过频繁, 等待 %d 秒后重试", wait)
+					time.Sleep(time.Duration(wait) * time.Second)
 					continue
 				}
-			}
-
-			// 如果是其它错误或刷新失败, 也给一次重试机会（网络抖动等）
-			time.Sleep(time.Duration(count+1) * time.Second)
-			continue
-		}
-
-		if obj, ok := res.(*telegram.UploadFileObj); ok {
-			return obj.Bytes, nil
-		}
-		return nil, fmt.Errorf("未知的响应类型: %T", res)
-	}
-	return nil, err
-}
-
-func (reader *Reader) refresh(version int64) (refreshed bool, waitDuration time.Duration) {
-	reader.Mutex.Lock()
-
-	// 如果别人正在刷新 → 等
-	for reader.Refreshing {
-		reader.Cond.Wait()
-	}
-
-	const cooldown = 8 * time.Second
-
-	currentVersion := reader.Version.Load()
-	if currentVersion > version {
-		// 其他 worker 已刷新过；计算需要等待多久才能让新引用在 Telegram 服务端生效
-		elapsed := time.Since(reader.LastRefresh)
-		if elapsed < cooldown {
-			remaining := cooldown - elapsed
-			log.Printf("其他 worker 刚刷新过文件引用 (版本 %d -> %d, %v前), 等待 %v 后复用", version, currentVersion, elapsed.Round(time.Millisecond), remaining.Round(time.Millisecond))
-			reader.Mutex.Unlock()
-			return true, remaining
-		}
-		log.Printf("其他 worker 已刷新文件引用 (版本 %d -> %d), 直接复用", version, currentVersion)
-		reader.Mutex.Unlock()
-		return true, 0
-	}
-
-	// 距上次刷新不足冷却时间，等剩余时间后再重试（避免拿到相同的过期引用）
-	if !reader.LastRefresh.IsZero() {
-		elapsed := time.Since(reader.LastRefresh)
-		if elapsed < cooldown {
-			remaining := cooldown - elapsed
-			log.Printf("距离上次刷新仅 %v, 等待 %v 后重试以避免获取到相同的过期引用", elapsed.Round(time.Millisecond), remaining.Round(time.Millisecond))
-			reader.Mutex.Unlock()
-			return true, remaining
-		}
-	}
-
-	reader.Refreshing = true
-	reader.Mutex.Unlock()
-
-	ms, err := reader.Client.GetMessages(reader.ChannelID, &telegram.SearchOption{IDs: []int32{reader.MessageID}})
-	if err != nil {
-		log.Printf("刷新消息位置失败: %v", err)
-		return false, 0
-	}
-
-	if len(ms) == 0 {
-		log.Printf("刷新消息位置失败: 未找到消息或消息列表为空")
-		return false, 0
-	}
-
-	log.Printf("成功获取消息进行刷新, 消息数量: %d", len(ms))
-	src := ms[0]
-	if !src.IsMedia() {
-		log.Printf("获取到的消息不包含媒体内容, 无法刷新文件引用")
-		return false, 0
-	}
-
-	newLoc, newDC, _, _, err := telegram.GetFileLocation(src.Media(), telegram.FileLocationOptions{})
-	if err != nil {
-		log.Printf("从媒体刷新文件位置失败: %v", err)
-		return false, 0
-	}
-
-	reader.Mutex.Lock()
-	reader.Refreshing = false
-	reader.Location = newLoc
-	reader.DC = newDC
-	reader.Version.Add(1)
-	reader.LastRefresh = time.Now()
-	reader.Cond.Broadcast()
-	reader.Mutex.Unlock()
-
-	log.Printf("成功刷新文件引用, DC: %d, 新位置: %+v", newDC, newLoc)
-	// 等待冷却时间让新引用在 Telegram 服务端生效
-	return true, cooldown
-}
-
-func (reader *Reader) Read(content []byte) (num int, err error) {
-	reader.Once.Do(reader.startFetching)
-
-	if reader.ReadBytes >= reader.ContentLength {
-		return 0, io.EOF
-	}
-
-	if reader.Pos >= len(reader.CurrBuffer) {
-		select {
-		case buff, ok := <-reader.Buffers:
-			if !ok {
-				select {
-				case err := <-reader.Errs:
-					return 0, err
-				default:
-					return 0, io.EOF
+				task.Error = err
+				task.Cond.L.Lock()
+				*task.Done = true
+				task.Cond.Signal()
+				task.Cond.L.Unlock()
+				return
+			} else {
+				duration := time.Since(start)
+				log.Printf("下载完成: cid=%d, mid=%d, start=%d, end=%d, content=%d, fileName=%s, duration=%.2fs", stream.CID, stream.MID, task.ContentStart, task.ContentEnd, len(content), fileName, duration.Seconds())
+				task.Cond.L.Lock()
+				content = content[task.Offset:]
+				if task.Content == nil {
+					task.Content = &content
+				} else {
+					*task.Content = content
 				}
+				*task.Done = true
+				task.Cond.Signal()
+				task.Cond.L.Unlock()
 			}
-			reader.CurrBuffer = buff
-			reader.Pos = 0
-		case err := <-reader.Errs:
-			return 0, err
-		case <-reader.Ctx.Done():
-			return 0, reader.Ctx.Err()
 		}
 	}
+}
 
-	num = copy(content, reader.CurrBuffer[reader.Pos:])
-	reader.Pos += num
-	reader.ReadBytes += int64(num)
-	return num, nil
+func (stream *Stream) clean() {
+	// 创建计时器
+	timeout := time.NewTimer(5 * time.Second)
+	defer timeout.Stop()
+
+	// 清理任务队列
+	for {
+		select {
+		case task := <-stream.Tasks:
+			if task != nil {
+				task.Content = nil
+				task = nil
+			}
+			// 重置计时器
+			if !timeout.Stop() {
+				<-timeout.C
+			}
+			timeout.Reset(5 * time.Second)
+		case <-timeout.C:
+			// 超时退出
+			return
+		default:
+			// 任务队列已清空
+			return
+		}
+	}
+}
+
+func (stream *Stream) refresh(version int64) {
+	stream.Mutex.Lock()
+	defer stream.Mutex.Unlock()
+
+	if version != stream.Version.Load() {
+		log.Printf("文件引用已刷新: cid=%d, mid=%d, version=%d, newVersion=%d", stream.CID, stream.MID, version, stream.Version.Load())
+		return
+	}
+
+	ms, err := stream.Client.GetMessages(stream.CID, &telegram.SearchOption{IDs: []int32{stream.MID}})
+	if err != nil {
+		stream.Error = fmt.Errorf("获取消息失败: cid=%d, mid=%d, err=%v", stream.CID, stream.MID, err)
+		return
+	}
+	if len(ms) == 0 {
+		stream.Error = fmt.Errorf("获取消息失败: cid=%d, mid=%d, err=未获取到消息", stream.CID, stream.MID)
+		return
+	}
+	src := ms[0]
+
+	// 确保消息包含媒体文件
+	if !src.IsMedia() {
+		stream.Error = fmt.Errorf("消息不包含媒体: cid=%d, mid=%d", stream.CID, stream.MID)
+		return
+	}
+	*stream.Src = src.Media()
+	stream.Version.Add(1)
+	log.Printf("文件引用已刷新: cid=%d, mid=%d, version=%d", stream.CID, stream.MID, stream.Version.Load())
 }

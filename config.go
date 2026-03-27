@@ -15,6 +15,7 @@ type Conf struct {
 	AppHash   string  `json:"hash"`               // Telegram API Hash
 	BotToken  string  `json:"botToken"`           // 接收/phone等命令的Bot Token
 	Password  string  `json:"password,omitempty"` // 访问/link的密码
+	DC        int     `json:"dc"`                 // User Bot 身份对应的DC
 	Port      int     `json:"port"`               // 程序运行的 HTTP 端口
 	Workers   int     `json:"workers"`            // 并发数
 	AppID     int32   `json:"id"`                 // Telegram API ID
