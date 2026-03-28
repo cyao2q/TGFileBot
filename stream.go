@@ -35,6 +35,7 @@ type Stream struct {
 	MaxCacheSize int64                  // 缓存最大值
 	TaskStart    *int64                 // 任务起点
 	TaskEnd      *int64                 // 任务终点
+	FileName     string                 // 文件名
 	Error        error                  // 错误
 	Count        atomic.Int64           // 任务数量
 	Version      atomic.Int64           // 版本号
@@ -51,17 +52,27 @@ func newTask() *Task {
 	}
 }
 
-func newStream(ctx context.Context, client *telegram.Client, media telegram.MessageMedia, workers int, mid int32, cid int64) *Stream {
+func newStream(ctx context.Context, client *telegram.Client, media telegram.MessageMedia, workers int, mid int32, cid int64, name string) *Stream {
+	chunkSize := int64(512 * 1024)
+	if workers == 1 {
+		chunkSize = 1024 * 1024
+	}
+	maxCacheSize := int64(32 * 1024 * 1024)
+	maxChans := int(maxCacheSize / chunkSize)
+	if maxChans == 0 {
+		maxChans = 1
+	}
 	return &Stream{
 		Ctx:          ctx,
 		Client:       client,
 		Src:          &media,
 		Workers:      workers,
+		FileName:     name,
 		MID:          mid,
 		CID:          cid,
 		ChunkSize:    512 * 1024,
-		MaxCacheSize: 32 * 1024 * 1024,
-		Tasks:        make(chan *Task, 256),
+		MaxCacheSize: maxCacheSize,
+		Tasks:        make(chan *Task, maxChans),
 		Mutex:        new(sync.Mutex),
 		TaskStart:    new(int64),
 		TaskEnd:      new(int64),
@@ -74,9 +85,6 @@ func (stream *Stream) start(contentStart, contentEnd int64) {
 	maxTasks := int(math.Ceil(float64(stream.ContentSize) / float64(stream.ChunkSize)))
 	if maxTasks > stream.Workers {
 		maxTasks = stream.Workers
-	}
-	if stream.Workers == 1 {
-		stream.ChunkSize = 1024 * 1024
 	}
 
 	for numTask := 1; numTask <= maxTasks; numTask++ {
@@ -120,7 +128,7 @@ func (stream *Stream) download(contentStart, contentEnd int64) {
 				// 成功发送任务
 			default:
 				// 任务队列已满
-				log.Printf("任务队列已满: cid=%d, mid=%d", stream.CID, stream.MID)
+				log.Printf("任务队列已满: cid=%d, mid=%d, fileName=%s", stream.CID, stream.MID, stream.FileName)
 				stream.Tasks <- task
 			}
 		}
@@ -136,7 +144,7 @@ func (stream *Stream) download(contentStart, contentEnd int64) {
 				switch {
 				case telegram.MatchError(err, "FILE_REFERENCE_EXPIRED"):
 					// 4. 检测 FILE_REFERENCE_EXPIRED 错误，重试
-					log.Printf("文件引用已过期: cid=%d, mid=%d, version=%d", stream.CID, stream.MID, version)
+					log.Printf("文件引用已过期: cid=%d, mid=%d, version=%d, fileName=%s", stream.CID, stream.MID, version, fileName)
 					stream.refresh(version)
 					continue
 				}
@@ -148,7 +156,7 @@ func (stream *Stream) download(contentStart, contentEnd int64) {
 				return
 			} else {
 				duration := time.Since(start)
-				log.Printf("下载完成: cid=%d, mid=%d, start=%d, end=%d, content=%d, fileName=%s, duration=%.2fs", stream.CID, stream.MID, task.ContentStart, task.ContentEnd, len(content), fileName, duration.Seconds())
+				log.Printf("切片下载完成: cid=%d, mid=%d, start=%d, end=%d, content=%d, fileName=%s, duration=%.2fs", stream.CID, stream.MID, task.ContentStart, task.ContentEnd, len(content), fileName, duration.Seconds())
 				task.Cond.L.Lock()
 				content = content[task.Offset:]
 				if task.Content == nil {
@@ -159,6 +167,7 @@ func (stream *Stream) download(contentStart, contentEnd int64) {
 				*task.Done = true
 				task.Cond.Signal()
 				task.Cond.L.Unlock()
+				break
 			}
 		}
 	}

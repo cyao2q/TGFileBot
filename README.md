@@ -2,6 +2,10 @@
 
 TGBot 是一个 Telegram Bot 和 UserBot 结合的项目，旨在提供文件直链分享、媒体流式传输以及通过 Telegram 机器人管理 UserBot 的功能。
 
+## 暂存问题
+
+由于 MTProto 协议更新导致某些账号输入 /code 验证码后出现 [PHONE_CODE_EXPIRED] 错误。等待上游 AmarnathCJD/gogram 更新解决。
+
 ## 功能特性
 
 - **文件直链分享**: 将 Telegram 中的媒体文件（图片、文档、视频、音频等）生成可直接访问的 HTTP 直链。

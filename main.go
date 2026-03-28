@@ -361,7 +361,6 @@ func (infos *Infos) startUserBot(phone string) (err error) {
 		}
 		return nil
 	default:
-		// infos.Status = 1
 		infos.Mutex.Unlock()
 		if infos.UserClient == nil {
 			if err := infos.userBotClient(); err != nil {
@@ -925,9 +924,9 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	stream := newStream(r.Context(), infos.Client, src.Media(), infos.Conf.Workers, mid, cid)
-	fileName := src.File.Name
 	size := src.File.Size
+	fileName := src.File.Name
+	stream := newStream(r.Context(), infos.Client, src.Media(), infos.Conf.Workers, mid, cid, fileName)
 
 	w.Header().Set("Accept-Ranges", "bytes")
 	w.Header().Set("Content-Type", handleMediaCate(fileName))
@@ -985,11 +984,11 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 		for {
 			select {
 			case <-r.Context().Done():
-				log.Printf("流式传输文件时已取消: cid=%d, mid=%d", cid, mid)
+				log.Printf("流式传输文件已取消: cid=%d, mid=%d, fileName=%s", cid, mid, fileName)
 				return
 			case task := <-stream.Tasks:
 				if task == nil {
-					log.Printf("流式传输文件时出错: cid=%d, mid=%d, err=任务为空", cid, mid)
+					log.Printf("流式传输文件出错: cid=%d, mid=%d, fileName=%s, error=任务为空", cid, mid, fileName)
 					continue
 				}
 				task.Cond.L.Lock()
@@ -998,7 +997,7 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 				}
 				task.Cond.L.Unlock()
 				if task.Error != nil {
-					log.Printf("流式传输文件时出错: cid=%d, mid=%d, err=%v", cid, mid, task.Error)
+					log.Printf("切片下载出错: cid=%d, mid=%d, start=%d, end=%d, fileName=%s, error=%+v", cid, mid, task.ContentStart, task.ContentEnd, fileName, task.Error)
 					return
 				}
 				if _, err := w.Write(*task.Content); err != nil {
@@ -1210,28 +1209,3 @@ func cleanFiles(realm CleanRealm) {
 		}
 	}
 }
-
-/*
-func extractDC(err error) int {
-	src := strings.ToUpper(err.Error())
-	switch {
-	case strings.Contains(src, "DC_MIGRATE"):
-		re := regexp.MustCompile(`DC.*?(\d+).`)
-		match := re.FindStringSubmatch(src)
-		if len(match) == 2 {
-			if dc, err := strconv.Atoi(match[1]); err == nil {
-				return dc
-			}
-		}
-	case strings.Contains(src, "PHONE_MIGRATE"):
-		re := regexp.MustCompile(`DC.*?(\d+).`)
-		match := re.FindStringSubmatch(src)
-		if len(match) == 2 {
-			if dc, err := strconv.Atoi(match[1]); err == nil {
-				return dc
-			}
-		}
-	}
-	return 0
-}
-*/
