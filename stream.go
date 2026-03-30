@@ -145,7 +145,14 @@ func (stream *Stream) download(numTask int, contentStart, contentEnd int64) {
 				case telegram.MatchError(err, "FILE_REFERENCE_EXPIRED"):
 					// 4. 检测 FILE_REFERENCE_EXPIRED 错误，重试
 					log.Printf("文件引用已过期: cid=%d, mid=%d, version=%d, fileName=%s, numTask=%d", stream.CID, stream.MID, version, stream.FileName, numTask)
-					stream.refresh(numTask, version)
+					if err := stream.refresh(numTask, version); err != nil {
+						task.Error = err
+						task.Cond.L.Lock()
+						*task.Done = true
+						task.Cond.Signal()
+						task.Cond.L.Unlock()
+						return
+					}
 					continue
 				}
 				task.Error = err
@@ -201,7 +208,7 @@ func (stream *Stream) clean() {
 	}
 }
 
-func (stream *Stream) refresh(numTask int,version int64) {
+func (stream *Stream) refresh(numTask int, version int64) (err error) {
 	stream.Mutex.Lock()
 	defer stream.Mutex.Unlock()
 
@@ -212,21 +219,25 @@ func (stream *Stream) refresh(numTask int,version int64) {
 
 	ms, err := stream.Client.GetMessages(stream.CID, &telegram.SearchOption{IDs: []int32{stream.MID}})
 	if err != nil {
-		stream.Error = fmt.Errorf("获取消息失败: cid=%d, mid=%d, err=%v", stream.CID, stream.MID, err)
-		return
+		// stream.Error = fmt.Errorf("获取消息失败: cid=%d, mid=%d, err=%v", stream.CID, stream.MID, err)
+		stream.Error = err
+		return err
 	}
 	if len(ms) == 0 {
-		stream.Error = fmt.Errorf("获取消息失败: cid=%d, mid=%d, err=未获取到消息", stream.CID, stream.MID)
-		return
+		err = fmt.Errorf("获取消息失败: cid=%d, mid=%d, err=未获取到消息", stream.CID, stream.MID)
+		stream.Error = err
+		return err
 	}
 	src := ms[0]
 
 	// 确保消息包含媒体文件
 	if !src.IsMedia() {
-		stream.Error = fmt.Errorf("消息不包含媒体: cid=%d, mid=%d", stream.CID, stream.MID)
-		return
+		err = fmt.Errorf("消息不包含媒体: cid=%d, mid=%d", stream.CID, stream.MID)
+		stream.Error = err
+		return err
 	}
 	*stream.Src = src.Media()
 	stream.Version.Add(1)
 	log.Printf("文件引用已刷新: cid=%d, mid=%d, numTask=%d, version=%d, newVersion=%d", stream.CID, stream.MID, numTask, version, stream.Version.Load())
+	return nil
 }

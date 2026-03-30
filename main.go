@@ -1269,7 +1269,7 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 
 	size := src.File.Size
 	fileName := src.File.Name
-	stream := newStream(r.Context(), infos.UserClient, src.Media(), infos.Conf.Workers, mid, cid, fileName)
+	stream := newStream(r.Context(), infos.Client, src.Media(), infos.Conf.Workers, mid, cid, fileName)
 	if src.Message.FwdFrom != nil {
 		if ch, ok := src.Message.FwdFrom.FromID.(*telegram.PeerChannel); ok {
 			stream.CID = ch.ChannelID
