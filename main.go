@@ -699,7 +699,7 @@ func (infos *Infos) search(channel, keywords string, page int) (items []Item, er
 		Query:  keywords,                             // 搜索关键字
 		Limit:  20,                                   // 条数限制
 		Offset: offset,                               // 偏移量
-		Filter: &telegram.InputMessagesFilterEmpty{}, // 过滤视频
+		Filter: &telegram.InputMessagesFilterVideo{}, // 过滤视频
 	})
 	if err != nil {
 		log.Printf("发送消息失败: %+v", err)
@@ -719,6 +719,9 @@ func (infos *Infos) search(channel, keywords string, page int) (items []Item, er
 		offSets.Mutex.Unlock()
 	}
 	for _, m := range ms {
+		if m.File == nil {
+			continue
+		}
 		name := strings.TrimSpace(m.File.Name)
 		if name == "" {
 			name = strings.TrimSpace(m.Text())
