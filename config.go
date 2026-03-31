@@ -15,6 +15,7 @@ type Conf struct {
 	AppHash   string  `json:"hash"`                // Telegram API Hash，从 my.telegram.org 获取
 	BotToken  string  `json:"botToken"`            // Telegram Bot Token，用于交互和管理
 	Password  string  `json:"password,omitempty"`  // 访问 /link 接口时可选的身份验证密码
+	Channels  []string `json:"channels,omitempty"` // 频道列表，用于搜索
 	DC        int     `json:"dc,omitempty"`        // 指定连接的 Telegram 数据中心 (Data Center) ID
 	Port      int     `json:"port"`                // 本地 HTTP 服务监听的端口
 	Workers   int     `json:"workers,omitempty"`   // 文件下载/串流时的并发协程数

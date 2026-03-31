@@ -1,7 +1,8 @@
 package main
 
 import (
-	"bufio"         // 用于读取文件流
+	"bufio" // 用于读取文件流
+	"context"
 	"crypto/md5"    // 用于计算哈希值
 	"encoding/hex"  // 用于进行十六进制编码
 	"encoding/json" // 用于处理 JSON 数据
@@ -20,8 +21,9 @@ import (
 	"strconv"       // 用于字符串和数值的相互转换
 	"strings"       // 用于字符串处理
 	"sync"          // 用于并发锁
-	"syscall"       // 用于处理操作系统信号
-	"time"          // 用于处理时间相关逻辑
+	"sync/atomic"
+	"syscall" // 用于处理操作系统信号
+	"time"    // 用于处理时间相关逻辑
 
 	"github.com/amarnathcjd/gogram/telegram" // 导入 gogram 客户端核心库
 )
@@ -41,6 +43,24 @@ type CleanRealm struct {
 	ID     string // 过滤 ID（如账号 ID）
 	Cate   string // 类型：bot 或 user
 	Realm  string // 范围：cache 或 session
+}
+
+type OffSet struct {
+	Offset int32     // 偏移量
+	Time   time.Time // 时间
+}
+
+type OffSets struct {
+	Mutex   *sync.Mutex       // 互斥锁，保护并发安全
+	OffSets map[string]OffSet // 偏移量映射
+}
+
+type Item struct {
+	Name    string `json:"name"`
+	Channel string `json:"channel"`
+	MID     int32  `json:"mid"`
+	CID     int64  `json:"cid"`
+	Size    int64  `json:"size"`
 }
 
 // Infos 结构体保存了程序运行时的全局状态和资源句柄
@@ -63,15 +83,16 @@ type Infos struct {
 }
 
 var infos *Infos
+var offSets *OffSets
 var startTime time.Time
-var version = "v1.0.4"
+var version = "v1.0.5"
 
 // main 是程序的入口函数
 func main() {
 	startTime = time.Now()
 	// 解析命令行参数
 	files := flag.String("files", "files", "配置文件所属目录路径（包含 config.json, session 等）")
-	file := flag.String("log", "files/log.log", "日志文件的存放路径")
+	file := flag.String("log", "", "日志文件的存放路径")
 	var ver bool
 	flag.BoolVar(&ver, "version", false, "显示程序版本号并退出")
 	flag.BoolVar(&ver, "v", false, "显示程序版本号并退出")
@@ -90,6 +111,8 @@ func main() {
 		return
 	}
 	infos = value
+
+	offSets = newOffSets()
 
 	// 2. 退出时的资源清理（延迟执行）
 	defer func() {
@@ -173,49 +196,59 @@ func main() {
 }
 
 func newInfos(filePath, filesPath string) (*Infos, error) {
-	// 创建日志文件
-	filePath = filepath.Clean(filePath)
-	file, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
-	if err != nil {
-		log.Printf("无法打开日志文件: %v", err)
+	infos := &Infos{
+		FilePath:  filePath,
+		FilesPath: filesPath,
+		Mutex:     new(sync.Mutex),
+		Code:      make(chan string, 1),
+		Pass:      make(chan string, 1),
+		Rex:       regexp.MustCompile(`(?:FLOOD_PREMIUM_WAIT_|A WAIT OF |FLOOD_WAIT_)(\d+)`),
 	}
-
-	// 设置日志输出
-	multiWriter := io.MultiWriter(os.Stdout, file)
-	log.SetOutput(multiWriter)
+	// 创建日志文件
+	if filePath != "" {
+		filePath = filepath.Clean(filePath)
+		file, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+		if err != nil {
+			log.Printf("无法打开日志文件: %v", err)
+		}
+		infos.File = file
+		// 设置日志输出
+		multiWriter := io.MultiWriter(os.Stdout, file)
+		log.SetOutput(multiWriter)
+	}
 
 	// 加载配置文件
 	conf, err := loadConf(filesPath)
 	if err != nil {
 		log.Fatalf("载入配置文件失败: %+v", err)
 	}
+	if conf.Workers == 0 {
+		conf.Workers = 1
+	}
+	infos.Conf = conf
+	infos.IDs = make(map[int64]string, len(conf.AdminIDs)+len(conf.WhiteIDs)+1)
 
 	// 获取 BotID
-	var botID int64
 	if conf.BotToken != "" {
 		parts := strings.Split(conf.BotToken, ":")
 		if len(parts) < 1 {
 			return nil, fmt.Errorf("BotToken 格式错误: %s", conf.BotToken)
 		}
 		result := strings.TrimSpace(parts[0])
-		botID, err = strconv.ParseInt(result, 10, 64)
+		infos.BotID, err = strconv.ParseInt(result, 10, 64)
 		if err != nil {
 			log.Printf("解析 BotID 失败: %+v", err)
 		}
 	}
 
-	return &Infos{
-		File:      file,
-		FilePath:  filePath,
-		FilesPath: filesPath,
-		Conf:      conf,
-		BotID:     botID,
-		Mutex:     new(sync.Mutex),
-		Code:      make(chan string, 1),
-		Pass:      make(chan string, 1),
-		IDs:       make(map[int64]string, len(conf.AdminIDs)+len(conf.WhiteIDs)+1),
-		Rex:       regexp.MustCompile(`(?:FLOOD_PREMIUM_WAIT_|A WAIT OF |FLOOD_WAIT_)(\d+)`),
-	}, nil
+	return infos, nil
+}
+
+func newOffSets() *OffSets {
+	return &OffSets{
+		Mutex:   new(sync.Mutex),
+		OffSets: make(map[string]OffSet),
+	}
 }
 
 func botConf(cate string) (botConf telegram.ClientConfig) {
@@ -647,6 +680,60 @@ func (infos *Infos) checkHash(hash string) int64 {
 	return 0
 }
 
+func (infos *Infos) search(channel, keywords string, page int) (items []Item, err error) {
+	ch, err := infos.UserClient.ResolvePeer(fmt.Sprintf("@%s", channel))
+	if err != nil {
+		log.Printf("频道解析失败: %+v", err)
+		return nil, err
+	}
+
+	var offset int32 = 0
+	offSets.Mutex.Lock()
+	key := fmt.Sprintf("%s|%s|%d", channel, keywords, page)
+	if values, ok := offSets.OffSets[key]; ok && time.Since(values.Time) < time.Hour {
+		offset = values.Offset
+	}
+	offSets.Mutex.Unlock()
+
+	ms, err := infos.UserClient.GetMessages(ch, &telegram.SearchOption{
+		Query:  keywords,                             // 搜索关键字
+		Limit:  20,                                   // 条数限制
+		Offset: offset,                               // 偏移量
+		Filter: &telegram.InputMessagesFilterEmpty{}, // 过滤视频
+	})
+	if err != nil {
+		log.Printf("发送消息失败: %+v", err)
+		return nil, err
+	}
+	if len(ms) == 0 {
+		return nil, errors.New("未找到匹配消息")
+	}
+
+	if len(ms) == 20 {
+		key := fmt.Sprintf("%s|%s|%d", channel, keywords, page+1)
+		offSets.Mutex.Lock()
+		offSets.OffSets[key] = OffSet{
+			Offset: ms[len(ms)-1].ID,
+			Time:   time.Now(),
+		}
+		offSets.Mutex.Unlock()
+	}
+	for _, m := range ms {
+		name := strings.TrimSpace(m.File.Name)
+		if name == "" {
+			name = strings.TrimSpace(m.Text())
+		}
+		items = append(items, Item{
+			Name:    name,
+			Size:    m.File.Size,
+			CID:     m.Channel.ID,
+			MID:     m.ID,
+			Channel: m.Channel.Title,
+		})
+	}
+	return items, nil
+}
+
 // handleMain 是 HTTP 服务的主分发函数，根据路径路由到不同的处理器
 func handleMain(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
@@ -676,6 +763,10 @@ func handleMain(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(path, "/stream"):
 		// 处理文件分片流式下载（串流播放）核心接口
 		handleStream(w, r)
+		return
+	case strings.HasPrefix(path, "/search"):
+		// 处理搜索
+		handleSearch(w, r)
 		return
 	default:
 		// 404
@@ -991,6 +1082,50 @@ func handleBotCommand(m *telegram.NewMessage) error {
 			return nil
 		}
 		return nil
+	case strings.HasPrefix(text, "/add"):
+		if !infos.isAdmin(m.SenderID()) {
+			sendMS(m, "你没有使用此命令的权限", nil, 60)
+			return nil
+		}
+		channel := strings.TrimSpace(strings.TrimPrefix(text, "/add"))
+		if channel == "" {
+			sendMS(m, "请提供要添加的频道别名", nil, 60)
+			return nil
+		} else {
+			infos.Mutex.Lock()
+			infos.Conf.Channels = append(infos.Conf.Channels, channel)
+			infos.HasNew = true
+			infos.Mutex.Unlock()
+			sendMS(m, fmt.Sprintf("添加频道成功: %s", channel), nil, 60)
+		}
+		return nil
+	case strings.HasPrefix(text, "/del"):
+		if !infos.isAdmin(m.SenderID()) {
+			sendMS(m, "你没有使用此命令的权限", nil, 60)
+			return nil
+		}
+		channel := strings.TrimSpace(strings.TrimPrefix(text, "/del"))
+		if channel == "" {
+			sendMS(m, "请提供要移除的频道别名", nil, 60)
+			return nil
+		} else {
+			infos.Mutex.Lock()
+			oldLen := len(infos.Conf.Channels)
+			infos.Conf.Channels = slices.DeleteFunc(infos.Conf.Channels, func(key string) bool {
+				return key == channel
+			})
+			newLen := len(infos.Conf.Channels)
+			infos.Mutex.Unlock()
+			if oldLen > newLen {
+				infos.Mutex.Lock()
+				infos.HasNew = true
+				infos.Mutex.Unlock()
+				sendMS(m, fmt.Sprintf("移除频道成功: %s", channel), nil, 60)
+			} else {
+				sendMS(m, fmt.Sprintf("频道 %s 不在白名单中", channel), nil, 60)
+			}
+		}
+		return nil
 	case strings.HasPrefix(text, "/port"):
 		if !infos.isAdmin(m.SenderID()) {
 			sendMS(m, "你没有使用此命令的权限", nil, 60)
@@ -1069,6 +1204,7 @@ func handleBotCommand(m *telegram.NewMessage) error {
 		return nil
 	default:
 		if !infos.isWhite(m.SenderID()) && m.SenderID() != 0 {
+			sendMS(m, "你没有使用此机器人的权限", nil, 60)
 			return nil
 		}
 		return handleMess(m)
@@ -1142,6 +1278,79 @@ func handleMediaCate(fileName string) string {
 	default:
 		return "application/octet-stream"
 	}
+}
+
+func handleSearch(w http.ResponseWriter, r *http.Request) {
+	if infos.UserClient == nil {
+		http.Error(w, "userBot 未登录, 无法使用搜索功能", http.StatusUnauthorized)
+		return
+	}
+	params := r.URL.Query()
+	keywords := params.Get("keywords")
+	if keywords == "" {
+		http.Error(w, "缺少关键词", http.StatusBadRequest)
+		return
+	}
+	value := params.Get("page")
+	if value == "" {
+		log.Printf("缺少页码")
+		value = "1"
+	}
+	page, err := strconv.Atoi(value)
+	if err != nil || page <= 0 {
+		page = 1
+	}
+	ctx, cannel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cannel()
+	count := atomic.Int64{}
+	results := make(chan []Item, len(infos.Conf.Channels))
+
+	for _, channel := range infos.Conf.Channels {
+		count.Add(1)
+		channel = strings.TrimPrefix(channel, "@")
+		go func(channel string) {
+			defer count.Add(-1)
+			result, err := infos.search(channel, keywords, page)
+			if err != nil {
+				log.Printf("搜索失败: %+v", err)
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case results <- result:
+			default:
+				log.Print("搜索通道已满")
+			}
+		}(channel)
+	}
+
+	items := make([]Item, 0, len(infos.Conf.Channels)*20)
+	defer func() {
+		content, err := json.Marshal(items)
+		if err != nil {
+			fmt.Println("JSON序列化失败:", err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(content)
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case result := <-results:
+			if len(result) > 0 {
+				items = append(items, result...)
+			}
+		default:
+			if count.Load() == 0 {
+				return
+			}
+		}
+	}
+
 }
 
 // handleStream 处理来自 HTTP 的文件流式读取请求
