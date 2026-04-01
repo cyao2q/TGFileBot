@@ -1642,6 +1642,13 @@ func handleLink(w http.ResponseWriter, r *http.Request) {
 	re := regexp.MustCompile(`t\.me\/(c\/(\d+)|([a-zA-Z0-9_]+))\/(\d+)(?:\?.*comment=(\d+))?`)
 	matches := re.FindAllStringSubmatch(src, -1)
 	res.Matches = matches
+	value := params.Get("uid")
+	res.UID, err = strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		log.Printf("转换UID错误: %+v", err)
+	}
+	res.Pass = params.Get("key")
+	res.Hash = params.Get("hash")
 
 	// 4. 调用解析核心逻辑提取直链
 	for _, link := range hackLink(res) {
@@ -1673,6 +1680,8 @@ func checkPass(params handleUrl.Values) error {
 				log.Printf("UID无效: %s", value)
 				return errors.New("无效的UID")
 			}
+		default:
+			return errors.New("您没有权限访问此链接")
 		}
 	}
 	return nil
