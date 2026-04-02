@@ -111,8 +111,8 @@ func (stream *Stream) start(contentStart, contentEnd int64) {
 
 // download 是工作协程的核心逻辑，负责循环领取并下载文件分片
 func (stream *Stream) download(numTask int, contentStart, contentEnd int64) {
-	log.Printf("携程%d开始下载: cid=%d, mid=%d, fileName=%s", numTask, stream.CID, stream.MID, stream.FileName)
-	defer log.Printf("携程%d结束下载: cid=%d, mid=%d, fileName=%s", numTask, stream.CID, stream.MID, stream.FileName)
+	log.Printf("协程%d开始下载: cid=%d, mid=%d, fileName=%s", numTask, stream.CID, stream.MID, stream.FileName)
+	defer log.Printf("协程%d结束下载: cid=%d, mid=%d, fileName=%s", numTask, stream.CID, stream.MID, stream.FileName)
 	for {
 		stream.Mutex.Lock()
 		task := newTask()
