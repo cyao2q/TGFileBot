@@ -1219,13 +1219,20 @@ func handleBotCommand(m *telegram.NewMessage) error {
 		num := 10
 		content := strings.TrimSpace(strings.TrimPrefix(text, "/info"))
 		if content != "" {
-			if value, err := strconv.Atoi(content); err == nil && value > 0 {
-				num = value
+			src, value := extractContent(content)
+			if value != nil {
+				num = *value
 			}
+			content = src
 		}
 
 		// 读取日志
-		lines, err := readLastLines(infos.FilePath, num)
+		if infos.FilePath == "" {
+			sendMS(m, "暂未开启日志记录", nil, 60)
+			return nil
+		}
+
+		lines, err := readLastLines(infos.FilePath, content, num)
 		if err != nil {
 			sendMS(m, fmt.Sprintf("读取日志失败: %+v", err), nil, 60)
 			return nil
@@ -1385,7 +1392,7 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 			defer count.Add(-1)
 			result, err := infos.search(channel, keywords, page, limit)
 			if err != nil {
-				log.Printf("搜索失败: %+v", err)
+				// log.Printf("搜索失败: %+v", err)
 				return
 			}
 			select {
@@ -1699,7 +1706,7 @@ func handleTime(secs uint64) string {
 }
 
 // readLastLines 读取日志文件的最后指定行数，供管理员查看
-func readLastLines(filePath string, count int) (lines []string, err error) {
+func readLastLines(filePath, src string, count int) (lines []string, err error) {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return nil, err
@@ -1710,10 +1717,13 @@ func readLastLines(filePath string, count int) (lines []string, err error) {
 		}
 	}()
 
+	re := regexp.MustCompile(src)
 	// 使用 Scanner 遍历文件行
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
-		lines = append(lines, scanner.Text())
+		if re.MatchString(scanner.Text()) {
+			lines = append(lines, scanner.Text())
+		}
 		// 超过行数限制后，舍弃旧行（滑动窗口效果）
 		if len(lines) > count {
 			lines = lines[1:]
@@ -1925,4 +1935,32 @@ func cleanFiles(realm CleanRealm) {
 			log.Printf("删除缓存文件失败: %v", err)
 		}
 	}
+}
+
+func extractContent(src string) (string, *int) {
+	src = strings.TrimSpace(src)
+
+	// 1. 如果整个字符串就是一个数字 (对应情况：纯数字)
+	if num, err := strconv.Atoi(src); err == nil {
+		return "", &num
+	}
+
+	// 3. 寻找主体部分最后一个空格
+	count := strings.LastIndexByte(src, ' ')
+	if count == -1 {
+		// 主体中没有空格，说明只有一种内容。
+		// 由于第一步已经排除了整个是纯数字的情况，所以如果是 "re 123"，123 到底是XXX还是数字？
+		// 按照通常逻辑 "re XXX"，这个单词就是 XXX
+		return src, nil
+	}
+
+	// 4. 判断最后一个空格后面那一截是不是数字
+	content := src[count+1:]
+	if num, err := strconv.Atoi(content); err == nil {
+		// 解析数字成功，说明最后一个空格前面的是 XXX，后面的是数字
+		return src[:count], &num
+	}
+
+	// 5. 最后一个空格后面不是数字，说明整个 body 都是 XXX（例如 "re hello world"）
+	return src, nil
 }
