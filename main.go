@@ -428,8 +428,16 @@ func (infos *Infos) startBot() (err error) {
 	}
 	commands = append(commands, commonCommands...)
 
-	client.SetBotCommands(commands, &userID)
-	client.SetBotCommands(commonCommands, nil)
+	_, err = client.SetBotCommands(commands, &userID)
+	if err != nil {
+		log.Printf("设置 Bot 超级管理员命令失败: %+v", err)
+		return err
+	}
+	_, err = client.SetBotCommands(commonCommands, nil)
+	if err != nil {
+		log.Printf("设置 Bot 管理员命令失败: %+v", err)
+		return err
+	}
 
 	log.Printf("Bot 启动成功")
 
@@ -1486,21 +1494,18 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "缺少关键词", http.StatusBadRequest)
 		return
 	}
-	value := params.Get("page")
-	if value == "" {
-		value = "1"
-	}
-	page, err := strconv.Atoi(value)
+
+	page, err := strconv.Atoi(params.Get("page"))
 	if err != nil || page <= 0 {
 		page = 1
 	}
-	value = params.Get("offset")
-	offset, err := strconv.ParseInt(value, 10, 32)
+
+	offset, err := strconv.ParseInt(params.Get("offset"), 10, 32)
 	if err != nil || offset <= 0 {
 		offset = 0
 	}
 
-	limit, err := strconv.Atoi(value)
+	limit, err := strconv.Atoi(params.Get("limit"))
 	if err != nil || limit <= 0 {
 		limit = 20
 	}

@@ -80,7 +80,7 @@ func newStream(ctx context.Context, client *telegram.Client, media telegram.Mess
 		FileName:     name,
 		MID:          mid,
 		CID:          cid,
-		ChunkSize:    512 * 1024, // 这里设置了固定值，可以根据需要调整
+		ChunkSize:    chunkSize, // 这里设置了固定值，可以根据需要调整
 		MaxCacheSize: maxCacheSize,
 		Tasks:        make(chan *Task, maxChans),
 		Mutex:        new(sync.Mutex),
@@ -161,6 +161,7 @@ func (stream *Stream) download(numTask int, contentStart, contentEnd int64) {
 			version := stream.Version.Load()
 			// 调用 Gogram 接口从 Telegram 下载特定范围的文件块
 			content, fileName, err := stream.Client.DownloadChunk(*stream.Src, int(task.ContentStart), int(task.ContentEnd), int(stream.ChunkSize), false, stream.Ctx, 90*time.Second)
+			// content, fileName, err := stream.Client.DownloadChunk(*stream.Src, int(task.ContentStart), int(task.ContentEnd), int(stream.ChunkSize))
 			if err != nil {
 				switch {
 				case telegram.MatchError(err, "FILE_REFERENCE_EXPIRED"):
