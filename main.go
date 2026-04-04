@@ -77,12 +77,13 @@ type Infos struct {
 	Client     *telegram.Client // 当前活跃客户端指针
 	Mutex      *sync.Mutex      // 全局互斥锁，保护并发安全
 	Conf       *Conf            // 指向全局配置
+	File       *os.File         // 日志文件句柄
 	HasNew     bool             // 标记配置是否被动态修改需要持久化
 	FilesPath  string           // 配置文件存放目录
 	FilePath   string           // 日志文件路径
-	File       *os.File         // 日志文件句柄
 	Status     int              // UserBot 登录状态: 0 未登录, 1 等待验证码, 2 等待二步验证, 3 已登录
 	BotID      int64            // Bot 自身的 ID
+	WaitUntil  atomic.Int64     // 等待结束时间
 	Code       chan string      // 用于接收异步提交的验证码
 	Pass       chan string      // 用于接收异步提交的二步验证密码
 	IDs        map[int64]string // 缓存用户 ID 到哈希的映射，减少重复计算
@@ -92,7 +93,7 @@ type Infos struct {
 var infos *Infos
 var offSets *OffSets
 var startTime time.Time
-var version = "v1.0.5"
+var version = "v1.0.6"
 
 // main 是程序的入口函数
 func main() {
@@ -282,8 +283,10 @@ func botConf(cate string) (botConf telegram.ClientConfig) {
 					wait = value
 				}
 			}
-			log.Printf("下载太过频繁, 等待 %d 秒后重试", wait)
-			time.Sleep(time.Duration(wait) * time.Second)
+			log.Printf("下载太过频繁, 等待 %d 秒后重试", wait+1)
+			waitUntil := time.Now().Add(time.Duration(wait+1) * time.Second)
+			infos.WaitUntil.Store(waitUntil.Unix())
+			time.Sleep(time.Duration(wait+1) * time.Second)
 			return true
 		},
 	}

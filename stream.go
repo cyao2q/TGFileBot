@@ -155,10 +155,16 @@ func (stream *Stream) download(numTask int, contentStart, contentEnd int64) {
 
 		// 尝试下载该分片，最多重试 3 次
 		for num := 1; num <= 3; num++ {
+			if waitUntil := infos.WaitUntil.Load(); waitUntil > 0 {
+				if remaining := time.Until(time.Unix(0, waitUntil)); remaining > 0 {
+					log.Printf("协程%d: 检测到FloodWait, 等待 %.2f 秒", numTask, remaining.Seconds())
+					time.Sleep(remaining)
+				}
+			}
+
 			version := stream.Version.Load()
 			// 调用 Gogram 接口从 Telegram 下载特定范围的文件块
 			content, fileName, err := stream.Client.DownloadChunk(*stream.Src, int(task.ContentStart), int(task.ContentEnd), int(stream.ChunkSize), false, stream.Ctx, 90*time.Second)
-			// content, fileName, err := stream.Client.DownloadChunk(*stream.Src, int(task.ContentStart), int(task.ContentEnd), int(stream.ChunkSize))
 			if err != nil {
 				switch {
 				case telegram.MatchError(err, "FILE_REFERENCE_EXPIRED"):
