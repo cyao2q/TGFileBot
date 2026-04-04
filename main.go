@@ -1804,7 +1804,10 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
 		switch {
 		case start < headSize:
-			if value, ok := infos.HeadCache[cacheKey]; ok {
+			infos.Mutex.Lock()
+			value, ok := infos.HeadCache[cacheKey]
+			infos.Mutex.Unlock()
+			if ok {
 				cacheSize := int64(len(value.Content))
 				if start < value.Start+cacheSize && start >= value.Start {
 					log.Printf("头部缓存命中: cid=%d, mid=%d, start=%d, end=%d", cid, mid, value.Start, value.End)
@@ -1828,7 +1831,10 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		case start >= tailStart:
-			if value, ok := infos.TailCache[cacheKey]; ok {
+			infos.Mutex.Lock()
+			value, ok := infos.TailCache[cacheKey]
+			infos.Mutex.Unlock()
+			if ok {
 				cacheSize := int64(len(value.Content))
 				if start < value.Start+cacheSize && start >= value.Start {
 					log.Printf("尾部缓存命中: cid=%d, mid=%d, start=%d, end=%d", cid, mid, value.Start, value.End)
@@ -1853,68 +1859,6 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 			}
 
 		}
-		// --- 尾部缓存检查 ---
-
-		/*
-			infos.Mutex.Lock()
-			// 命中条件: start 落在头部缓存范围内 [0, headSize)
-			if start < headSize {
-				if hc, ok := infos.HeadCache[cacheKey]; ok && int64(len(hc.Content)) > 0 {
-					// 命中：切取 [start, min(headSize-1, end)] 部分先写出
-					cacheEnd := hc.End
-					if end < cacheEnd {
-						cacheEnd = end
-					}
-					cacheSlice := hc.Content[start : cacheEnd+1]
-					infos.Mutex.Unlock()
-					log.Printf("头部缓存命中: cid=%d, mid=%d, start=%d, cacheEnd=%d", cid, mid, start, cacheEnd)
-					if _, err := w.Write(cacheSlice); err != nil {
-						log.Printf("写入头部缓存时出错: cid=%d, mid=%d, err=%v", cid, mid, err)
-						return
-					}
-					if cacheEnd >= end {
-						// 整个请求范围都被缓存覆盖，直接返回
-						log.Printf("头部缓存完全覆盖请求: cid=%d, mid=%d", cid, mid)
-						return
-					}
-					// 从缓存结束位置之后继续下载
-					downloadStart = cacheEnd + 1
-					infos.Mutex.Lock()
-				}
-			}
-
-			// --- 尾部缓存检查 ---
-			// 命中条件: start >= tailStart（请求从尾部区域开始）
-			if start >= tailStart {
-				if tc, ok := infos.TailCache[cacheKey]; ok && int64(len(tc.Content)) > 0 {
-					// 命中：切取 [start-tailStart, end-tailStart] 部分先写出
-					sliceStart := start - tc.Start
-					sliceEnd := end - tc.Start
-					if sliceStart < 0 {
-						sliceStart = 0
-					}
-					if sliceEnd >= int64(len(tc.Content)) {
-						sliceEnd = int64(len(tc.Content)) - 1
-					}
-					cacheSlice := tc.Content[sliceStart : sliceEnd+1]
-					infos.Mutex.Unlock()
-					log.Printf("尾部缓存命中: cid=%d, mid=%d, start=%d, sliceStart=%d, sliceEnd=%d", cid, mid, start, sliceStart, sliceEnd)
-					if _, err := w.Write(cacheSlice); err != nil {
-						log.Printf("写入尾部缓存时出错: cid=%d, mid=%d, err=%v", cid, mid, err)
-						return
-					}
-					if tc.Start+sliceEnd >= end {
-						log.Printf("尾部缓存完全覆盖请求: cid=%d, mid=%d", cid, mid)
-						return
-					}
-					// 继续下载尾部缓存结束后的部分（理论上缓存设计为覆盖到文件末尾，通常不会走到这里）
-					downloadStart = tc.End + 1
-					infos.Mutex.Lock()
-				}
-			}
-
-			infos.Mutex.Unlock()
-		*/
 	}
 
 	// 9. 启动并发下载协程（以调整后的 downloadStart 为起点）
