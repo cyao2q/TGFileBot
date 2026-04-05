@@ -884,6 +884,7 @@ func (infos *Infos) search(channel, keywords string, page, limit int, offset int
 		for chunk := range slices.Chunk(mids, 100) {
 			ms, err = infos.UserClient.GetMessages(ch, &telegram.SearchOption{
 				IDs:    chunk,
+				Limit:  100,
 				Filter: &telegram.InputMessagesFilterVideo{}, // 过滤视频
 			})
 			if err != nil {
@@ -892,7 +893,7 @@ func (infos *Infos) search(channel, keywords string, page, limit int, offset int
 			results = append(results, ms)
 		}
 	}
-	
+
 	for _, ms := range results {
 		for _, m := range ms {
 			if m.File == nil {
