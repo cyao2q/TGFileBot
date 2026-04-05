@@ -299,7 +299,7 @@ func botConf(cate string) (botConf telegram.ClientConfig) {
 					wait = value
 				}
 			}
-			log.Printf("下载太过频繁, 等待 %d 秒后重试", wait+1)
+			log.Printf("访问太过频繁, 等待 %d 秒后重试", wait+1)
 			waitUntil := time.Now().Add(time.Duration(wait+1) * time.Second)
 			infos.WaitUntil.Store(waitUntil.Unix())
 			time.Sleep(time.Duration(wait+1) * time.Second)
@@ -853,23 +853,70 @@ func (infos *Infos) search(channel, keywords string, page, limit int, offset int
 		}
 		offSets.Mutex.Unlock()
 	}
+
+	maxCount := 3
+	rids := make(map[int64]bool)
+	mids := make([]int32, 0, len(ms)*maxCount)
+	seen := make(map[int32]bool)
 	for _, m := range ms {
 		if m.File == nil {
 			continue
 		}
-		if items.Channel == "" {
-			items.Channel = strings.TrimSpace(m.Channel.Title)
+		if m.Message.GroupedID != 0 {
+			for num := 0; num < maxCount; num++ {
+				mid := m.ID + int32(num)
+				if value, ok := seen[mid]; ok && value {
+					continue
+				}
+				seen[mid] = true
+				mids = append(mids, mid)
+				rids[m.Message.GroupedID] = true
+			}
+		} else {
+			mids = append(mids, m.ID)
 		}
-		name := strings.TrimSpace(m.File.Name)
-		if name == "" {
-			name = strings.TrimSpace(m.Text())
+	}
+
+	results := [][]telegram.NewMessage{ms}
+
+	if len(rids) > 0 {
+		results = make([][]telegram.NewMessage, 0, (len(mids)/100)+1)
+		for chunk := range slices.Chunk(mids, 100) {
+			ms, err = infos.UserClient.GetMessages(ch, &telegram.SearchOption{
+				IDs:    chunk,
+				Filter: &telegram.InputMessagesFilterVideo{}, // 过滤视频
+			})
+			if err != nil {
+				continue
+			}
+			results = append(results, ms)
 		}
-		items.Item = append(items.Item, Item{
-			Name: name,
-			Size: m.File.Size,
-			CID:  m.Channel.ID,
-			MID:  m.ID,
-		})
+	}
+	
+	for _, ms := range results {
+		for _, m := range ms {
+			if m.File == nil {
+				continue
+			}
+			if items.Channel == "" {
+				items.Channel = strings.TrimSpace(m.Channel.Title)
+			}
+
+			if value, ok := rids[m.Message.GroupedID]; !ok || !value {
+				continue
+			}
+
+			name := strings.TrimSpace(m.File.Name)
+			if name == "" {
+				name = strings.TrimSpace(m.Text())
+			}
+			items.Item = append(items.Item, Item{
+				Name: name,
+				Size: m.File.Size,
+				CID:  m.Channel.ID,
+				MID:  m.ID,
+			})
+		}
 	}
 	return items, nil
 }
