@@ -57,6 +57,84 @@ func handleMain(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// parseStreamParams 解析流式下载请求参数
+func parseStreamParams(r *http.Request) (cid int64, mid int32, cate string, err error) {
+	params := r.URL.Query()
+	if err = checkPass(params); err != nil {
+		return 0, 0, "", err
+	}
+	cid, err = strconv.ParseInt(params.Get("cid"), 10, 64)
+	if err != nil || cid == 0 {
+		if infos.Conf.ChannelID != 0 {
+			cid = infos.Conf.ChannelID
+		} else {
+			return 0, 0, "", fmt.Errorf("频道ID无效")
+		}
+	}
+	value, err := strconv.ParseInt(params.Get("mid"), 10, 32)
+	if err != nil || value == 0 {
+		re := regexp.MustCompile(`/stream/(\d+)/[a-zA-Z0-9]+`)
+		matches := re.FindStringSubmatch(r.URL.Path)
+		if len(matches) == 2 {
+			value, err = strconv.ParseInt(matches[1], 10, 32)
+			if err != nil || value == 0 {
+				return 0, 0, "", fmt.Errorf("消息ID无效")
+			}
+		} else {
+			return 0, 0, "", fmt.Errorf("消息ID无效")
+		}
+	}
+	mid = int32(value)
+	cate = params.Get("cate")
+	return cid, mid, cate, nil
+}
+
+// parseRangeHeader 解析 HTTP Range 头
+func parseRangeHeader(rangeHeader string, size int64) (start, end int64) {
+	if rangeHeader == "" {
+		return 0, size - 1
+	}
+	rangeStr := strings.TrimSpace(strings.TrimPrefix(rangeHeader, "bytes="))
+	parts := strings.SplitN(rangeStr, "-", 2)
+	if len(parts) == 2 {
+		if parts[0] == "" {
+			suffixLength, err := strconv.ParseInt(parts[1], 10, 64)
+			if err == nil && suffixLength > 0 {
+				start = size - suffixLength
+				end = size - 1
+				if start < 0 {
+					start = 0
+				}
+			} else {
+				start, end = 0, size-1
+			}
+		} else {
+			var err error
+			start, err = strconv.ParseInt(parts[0], 10, 64)
+			if err != nil {
+				start = 0
+			}
+			if parts[1] != "" {
+				end, err = strconv.ParseInt(parts[1], 10, 64)
+				if err != nil {
+					end = size - 1
+				}
+			} else {
+				end = size - 1
+			}
+		}
+	} else {
+		start, end = 0, size-1
+	}
+	if end >= size {
+		end = size - 1
+	}
+	if start > end {
+		start = end
+	}
+	return start, end
+}
+
 // handleStream 处理来自 HTTP 的文件流式读取请求
 // 该函数实现了 Range 分段下载支持, 允许像播放普通 mp4 文件一样拖动进度条
 func handleStream(w http.ResponseWriter, r *http.Request) {
@@ -66,45 +144,18 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 1. 获取 URL 参数并完成身份校验
-	params := r.URL.Query()
-	if err := checkPass(params); err != nil {
-		http.Error(w, err.Error(), http.StatusUnauthorized)
+	// 1-2. 获取 URL 参数、完成身份校验、解析频道 ID 和消息 ID
+	cid, mid, cate, err := parseStreamParams(r)
+	if err != nil {
+		if err.Error() == "频道ID无效" || err.Error() == "消息ID无效" {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		} else {
+			http.Error(w, err.Error(), http.StatusUnauthorized)
+		}
 		return
 	}
 
-	// 2. 解析频道 ID 和消息 ID
-	cid, err := strconv.ParseInt(params.Get("cid"), 10, 64)
-	if err != nil || cid == 0 {
-		if infos.Conf.ChannelID != 0 {
-			cid = infos.Conf.ChannelID
-		} else {
-			log.Printf("频道ID无效: %s", params.Get("cid"))
-			http.Error(w, "频道ID无效", http.StatusBadRequest)
-			return
-		}
-	}
-
-	value, err := strconv.ParseInt(params.Get("mid"), 10, 32)
-	if err != nil || value == 0 {
-		// 尝试从路径中提取 (兼容模式)
-		re := regexp.MustCompile(`/stream/(\d+)/[a-zA-Z0-9]+`)
-		matches := re.FindStringSubmatch(r.URL.Path)
-		if len(matches) == 2 {
-			value, err = strconv.ParseInt(matches[1], 10, 32)
-			if err != nil || value == 0 {
-				http.Error(w, "消息ID无效", http.StatusBadRequest)
-				return
-			}
-		} else {
-			http.Error(w, "消息ID无效", http.StatusBadRequest)
-			return
-		}
-	}
-	mid := int32(value)
-
 	// 3. 选择下载客户端 (Bot 或 UserBot)
-	cate := params.Get("cate")
 	if cate == "user" && infos.Status.Load() == 3 {
 		infos.Client = infos.UserClient
 	} else {
@@ -152,58 +203,13 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Disposition", fmt.Sprintf("%s; filename=\"%s\"", disposition, fileName))
 
 	// 7. 处理 HTTP Range 请求（分段读取的核心逻辑）
-	var start, end int64
 	rangeHeader := r.Header.Get("Range")
+	start, end := parseRangeHeader(rangeHeader, size)
 
 	if rangeHeader == "" {
-		// 全量读取
-		start = 0
-		end = size - 1
 		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
 		w.WriteHeader(http.StatusOK)
 	} else {
-		// 处理 Range 范围, 例如：bytes=0-499 或 bytes=-500
-		rangeStr := strings.TrimSpace(strings.TrimPrefix(rangeHeader, "bytes="))
-		parts := strings.SplitN(rangeStr, "-", 2)
-		if len(parts) == 2 {
-			if parts[0] == "" {
-				// 后缀范围请求提取（如 bytes=-500 表示取最后 500 字节）
-				suffixLength, err := strconv.ParseInt(parts[1], 10, 64)
-				if err == nil && suffixLength > 0 {
-					start = size - suffixLength
-					end = size - 1
-					if start < 0 {
-						start = 0
-					}
-				} else {
-					start = 0
-					end = size - 1
-				}
-			} else {
-				// 正常范围请求（如 bytes=500-1000 或 bytes=500-）
-				start, err = strconv.ParseInt(parts[0], 10, 64)
-				if err != nil {
-					start = 0
-				}
-				if parts[1] != "" {
-					end, err = strconv.ParseInt(parts[1], 10, 64)
-					if err != nil {
-						end = size - 1
-					}
-				} else {
-					end = size - 1
-				}
-			}
-		} else {
-			start = 0
-			end = size - 1
-		}
-		if end >= size {
-			end = size - 1
-		}
-		if start > end {
-			start = end
-		}
 		contentLength := end - start + 1
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
 		w.Header().Set("Content-Length", strconv.FormatInt(contentLength, 10))
@@ -340,7 +346,7 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 				infos.Cond.Broadcast()
 				infos.Cond.L.Unlock()
 			}()
-			
+
 			result, err := infos.search(channel, keywords, page, limit, int32(offset))
 			if err != nil {
 				return

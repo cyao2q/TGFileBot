@@ -63,6 +63,14 @@ func newStream(ctx context.Context, client *telegram.Client, media telegram.Mess
 	if maxCacheSize == 0 {
 		maxCacheSize = 32 * 1024 * 1024
 	}
+	headSize := maxCacheSize / 2
+	if headSize > 8*1024*1024 {
+		headSize = 8 * 1024 * 1024
+	}
+	tailSize := maxCacheSize / 2
+	if tailSize > 8*1024*1024 {
+		tailSize = 8 * 1024 * 1024
+	}
 	// 计算任务管道的容量
 	maxChans := int(maxCacheSize / chunkSize)
 	if maxChans == 0 {
@@ -79,6 +87,8 @@ func newStream(ctx context.Context, client *telegram.Client, media telegram.Mess
 		ContentSize:  contentSize,
 		ChunkSize:    chunkSize, // 这里设置了固定值, 可以根据需要调整
 		MaxCacheSize: maxCacheSize,
+		HeadSize:     headSize,
+		TailSize:     tailSize,
 		Tasks:        make(chan *Task, maxChans),
 		Mutex:        new(sync.Mutex),
 		TaskStart:    new(int64),
@@ -173,8 +183,12 @@ func (stream *Stream) download(numTask int, contentStart, contentEnd int64) {
 				}
 			}
 			version := stream.Version.Load()
+			stream.Mutex.Lock()
+			srcCopy := *stream.Src
+			stream.Mutex.Unlock()
+
 			// 调用 Gogram 接口从 Telegram 下载特定范围的文件块
-			content, fileName, err := stream.Client.DownloadChunk(*stream.Src, int(task.ContentStart), int(task.ContentEnd), int(stream.ChunkSize), false, stream.Ctx, 90*time.Second)
+			content, fileName, err := stream.Client.DownloadChunk(srcCopy, int(task.ContentStart), int(task.ContentEnd), int(stream.ChunkSize), false, stream.Ctx, 90*time.Second)
 			if err != nil {
 				switch {
 				case telegram.MatchError(err, "FILE_REFERENCE_EXPIRED"):
@@ -207,6 +221,13 @@ func (stream *Stream) download(numTask int, contentStart, contentEnd int64) {
 						}
 						time.Sleep(time.Duration(wait+1) * time.Second)
 						continue
+					} else {
+						if num < maxCount {
+							backoff := time.Duration(1<<num) * time.Second // 2s, 4s, 8s...
+							log.Printf("协程%d: 网络错误重试 (%d/%d), 等待 %v. 错误: %v", numTask, num, maxCount, backoff, err)
+							time.Sleep(backoff)
+							continue
+						}
 					}
 				}
 
@@ -217,78 +238,80 @@ func (stream *Stream) download(numTask int, contentStart, contentEnd int64) {
 			}
 
 			// 缓存
-			infos.Mutex.Lock()
-			switch {
-			case task.ContentStart <= stream.HeadSize && task.ContentEnd <= stream.HeadSize:
-				if values, ok := infos.HeadCache[cacheKey]; ok {
-					values.Time = time.Now()
-					found := false
-					for _, c := range values.Contents {
-						if c.Start == task.ContentStart && c.End == task.ContentEnd {
-							found = true
-							break
+			if stream.HeadSize > 0 && stream.TailSize > 0 {
+				infos.Mutex.Lock()
+				switch {
+				case task.ContentStart <= stream.HeadSize && task.ContentEnd <= stream.HeadSize:
+					if values, ok := infos.HeadCache[cacheKey]; ok {
+						values.Time = time.Now()
+						found := false
+						for _, c := range values.Contents {
+							if c.Start == task.ContentStart && c.End == task.ContentEnd {
+								found = true
+								break
+							}
+						}
+						if !found {
+							// maxChunks = HeadSize / ChunkSize，即头部最多能存几个分片
+							maxChunks := int((stream.HeadSize+stream.ChunkSize-1)/stream.ChunkSize) + 1
+							lenContents := len(values.Contents)
+							if lenContents >= maxChunks {
+								// 淡出策略：保留靠近文件头的分片，删除 Start 最大的（距开头最远、最冗余）
+								maxNum := 0
+								for num := 1; num < lenContents; num++ {
+									if values.Contents[num].Start > values.Contents[maxNum].Start {
+										maxNum = num
+									}
+								}
+								values.Contents[maxNum] = values.Contents[lenContents-1]
+								values.Contents[lenContents-1] = MediaContent{}
+								values.Contents = values.Contents[:lenContents-1]
+							}
+							values.Contents = append(values.Contents, MediaContent{
+								Start:   task.ContentStart,
+								End:     task.ContentEnd,
+								Content: content,
+							})
+							infos.HeadCache[cacheKey] = values
 						}
 					}
-					if !found {
-						// maxChunks = HeadSize / ChunkSize，即头部最多能存几个分片
-						maxChunks := int((stream.HeadSize+stream.ChunkSize-1)/stream.ChunkSize) + 1
-						lenContents := len(values.Contents)
-						if lenContents >= maxChunks {
-							// 淡出策略：保留靠近文件头的分片，删除 Start 最大的（距开头最远、最冗余）
-							maxNum := 0
-							for num := 1; num < lenContents; num++ {
-								if values.Contents[num].Start > values.Contents[maxNum].Start {
-									maxNum = num
-								}
+				case task.ContentStart >= stream.ContentSize-stream.TailSize:
+					if values, ok := infos.TailCache[cacheKey]; ok {
+						values.Time = time.Now()
+						found := false
+						for _, c := range values.Contents {
+							if c.Start == task.ContentStart && c.End == task.ContentEnd {
+								found = true
+								break
 							}
-							values.Contents[maxNum] = values.Contents[lenContents-1]
-							values.Contents[lenContents-1] = MediaContent{}
-							values.Contents = values.Contents[:lenContents-1]
 						}
-						values.Contents = append(values.Contents, MediaContent{
-							Start:   task.ContentStart,
-							End:     task.ContentEnd,
-							Content: content,
-						})
-						infos.HeadCache[cacheKey] = values
+						if !found {
+							// maxChunks = TailSize / ChunkSize，即尾部最多能存几个分片
+							maxChunks := int((stream.TailSize+stream.ChunkSize-1)/stream.ChunkSize) + 1
+							lenContents := len(values.Contents)
+							if lenContents >= maxChunks {
+								// 淡出策略：保留靠近文件尾的分片，删除 Start 最小的（距结尾最远、最冗余）
+								minNum := 0
+								for num := 1; num < lenContents; num++ {
+									if values.Contents[num].Start < values.Contents[minNum].Start {
+										minNum = num
+									}
+								}
+								values.Contents[minNum] = values.Contents[lenContents-1]
+								values.Contents[lenContents-1] = MediaContent{}
+								values.Contents = values.Contents[:lenContents-1]
+							}
+							values.Contents = append(values.Contents, MediaContent{
+								Start:   task.ContentStart,
+								End:     task.ContentEnd,
+								Content: content,
+							})
+							infos.TailCache[cacheKey] = values
+						}
 					}
 				}
-			case task.ContentStart >= stream.ContentSize-stream.TailSize:
-				if values, ok := infos.TailCache[cacheKey]; ok {
-					values.Time = time.Now()
-					found := false
-					for _, c := range values.Contents {
-						if c.Start == task.ContentStart && c.End == task.ContentEnd {
-							found = true
-							break
-						}
-					}
-					if !found {
-						// maxChunks = TailSize / ChunkSize，即尾部最多能存几个分片
-						maxChunks := int((stream.TailSize+stream.ChunkSize-1)/stream.ChunkSize) + 1
-						lenContents := len(values.Contents)
-						if lenContents >= maxChunks {
-							// 淡出策略：保留靠近文件尾的分片，删除 Start 最小的（距结尾最远、最冗余）
-							minNum := 0
-							for num := 1; num < lenContents; num++ {
-								if values.Contents[num].Start < values.Contents[minNum].Start {
-									minNum = num
-								}
-							}
-							values.Contents[minNum] = values.Contents[lenContents-1]
-							values.Contents[lenContents-1] = MediaContent{}
-							values.Contents = values.Contents[:lenContents-1]
-						}
-						values.Contents = append(values.Contents, MediaContent{
-							Start:   task.ContentStart,
-							End:     task.ContentEnd,
-							Content: content,
-						})
-						infos.TailCache[cacheKey] = values
-					}
-				}
+				infos.Mutex.Unlock()
 			}
-			infos.Mutex.Unlock()
 
 			task.handleContent(content, contentEnd)
 			break
@@ -367,10 +390,14 @@ func (stream *Stream) clean() {
 		case task := <-stream.Tasks:
 			if task != nil {
 				// 等待任务完成后再释放, 避免与下载协程产生 data race
-				// 加入超时保护, 防止 panic 或未 close(Done) 带来的永久死锁
+				// 使用 timer 替代 time.After 避免内存泄漏
+				taskTimer := time.NewTimer(5 * time.Second)
 				select {
 				case <-task.Done:
-				case <-time.After(5 * time.Second):
+					if !taskTimer.Stop() {
+						<-taskTimer.C
+					}
+				case <-taskTimer.C:
 					log.Printf("清理任务时遇到阻塞过长, 强制丢弃: start=%d end=%d", task.ContentStart, task.ContentEnd)
 				}
 				task.Content = nil
