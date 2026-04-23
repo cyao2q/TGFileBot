@@ -190,7 +190,9 @@ func (stream *Stream) download(numTask int, contentStart, contentEnd int64) {
 
 			// 调用 Gogram 接口从 Telegram 下载特定范围的文件块
 			// 将超时时间从 90s 缩短至 10s 以解决冷启动 TCP 连接假死的问题 [BUG-001]
-			content, fileName, err := stream.Client.DownloadChunk(src, int(task.ContentStart), int(task.ContentEnd), int(stream.ChunkSize), false, stream.Ctx, 10*time.Second)
+			timeout := time.Duration(5 * num) * time.Second
+
+			content, fileName, err := stream.Client.DownloadChunk(src, int(task.ContentStart), int(task.ContentEnd), int(stream.ChunkSize), false, stream.Ctx, timeout)
 			if err != nil {
 				switch {
 				case telegram.MatchError(err, "FILE_REFERENCE_EXPIRED"):
