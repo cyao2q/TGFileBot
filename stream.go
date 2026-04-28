@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -170,6 +171,7 @@ func (stream *Stream) download(numTask int, contentStart, contentEnd int64) {
 		}
 
 		maxWait := 3
+		maxTimeoutRetries := 2 // TCP 超时免费重试次数（不计入 maxCount）
 		for num := 1; num <= maxCount; num++ {
 			// 从缓存读取
 			found := stream.handleCache(task, cacheKey, contentEnd)
@@ -190,14 +192,11 @@ func (stream *Stream) download(numTask int, contentStart, contentEnd int64) {
 			stream.Mutex.Unlock()
 
 			// 调用 Gogram 接口从 Telegram 下载特定范围的文件块
-			// 首次请求给足冷启动时间, 后续固定超时
-			timeout := 10 * time.Second
-			if num == 1 {
-				timeout = 15 * time.Second
-			}
+			timeout := 8 * time.Second
 
 			content, fileName, err := stream.Client.DownloadChunk(src, int(task.ContentStart), int(task.ContentEnd), int(stream.ChunkSize), false, stream.Ctx, timeout)
 			if err != nil {
+				errStr := strings.ToLower(err.Error())
 				switch {
 				// 如果 context 已经关闭（手动取消或整体超时），则彻底停止任务
 				case stream.Ctx.Err() != nil, errors.Is(err, context.Canceled):
@@ -212,10 +211,19 @@ func (stream *Stream) download(numTask int, contentStart, contentEnd int64) {
 						close(task.Done)
 						return
 					}
-					// 刷新成功后继续重试当前分片
+					continue
+				case strings.Contains(errStr, "deadline exceeded") ||
+					strings.Contains(errStr, "initialize worker: timeout") ||
+					strings.Contains(errStr, "get worker: timeout"):
+					log.Printf("协程%d: TCP连接超时 %d/%d, 错误: %v", numTask, num, maxCount, err)
+					time.Sleep(500 * time.Millisecond)
+					if maxTimeoutRetries > 0 {
+						maxTimeoutRetries--
+						num-- // 抵消 for 循环的 num++, 不计入重试次数
+					}
 					continue
 				default:
-					if matches := infos.Rex.FindStringSubmatch(err.Error()); len(matches) > 0 {
+					if matches := infos.Rex.FindStringSubmatch(errStr); len(matches) > 0 {
 						wait := 3
 						if len(matches) > 1 {
 							for _, match := range matches[1:] {
