@@ -16,13 +16,12 @@ import (
 
 // Task 代表一个下载分片任务
 type Task struct {
-	Offset       int64         // 任务在分片内的偏移量
-	ContentStart int64         // 任务请求的数据起点（绝对位置）
-	ContentEnd   int64         // 任务请求的数据终点（绝对位置）
-	Version      int64         // 任务对应的文件版本号, 用于处理引用过期
-	Error        error         // 下载过程中产生的错误
-	Done         chan struct{} // 用于通知该任务完成
-	Content      []byte        // 下载到的二进制内容
+	Offset       int64       // 任务在分片内的偏移量
+	ContentStart int64       // 任务请求的数据起点（绝对位置）
+	ContentEnd   int64       // 任务请求的数据终点（绝对位置）
+	Version      int64       // 任务对应的文件版本号, 用于处理引用过期
+	Error        error       // 下载过程中产生的错误
+	Content      chan []byte // 下载到的二进制内容
 }
 
 // Stream 结构体用于管理大文件的并发下载和流式传输
@@ -51,8 +50,8 @@ type Stream struct {
 // newTask 初始化并返回一个 Task 对象
 func newTask() *Task {
 	return &Task{
-		Error: nil,
-		Done:  make(chan struct{}),
+		Error:   nil,
+		Content: make(chan []byte, 1),
 	}
 }
 
@@ -208,14 +207,14 @@ func (stream *Stream) download(numTask int, contentStart, contentEnd int64) {
 				// 如果 context 已经关闭（手动取消或整体超时），则彻底停止任务
 				case stream.Ctx.Err() != nil, errors.Is(err, context.Canceled):
 					task.Error = errors.New("已取消下载任务")
-					close(task.Done)
+					close(task.Content)
 					return
 				case telegram.MatchError(err, "FILE_REFERENCE_EXPIRED"):
 					// 如果报错文件引用过期, 则调用 refresh 重新获取消息并更新引用
 					log.Printf("文件引用已过期: cid=%d, mid=%d, version=%d, name=%s, numTask=%d", stream.CID, stream.MID, version, fileName, numTask)
 					if err := stream.refresh(numTask, version); err != nil {
 						task.Error = err
-						close(task.Done)
+						close(task.Content)
 						return
 					}
 					continue
@@ -271,7 +270,7 @@ func (stream *Stream) download(numTask int, contentStart, contentEnd int64) {
 							continue
 						} else {
 							task.Error = err
-							close(task.Done)
+							close(task.Content)
 							return
 						}
 					}
@@ -359,7 +358,7 @@ func (stream *Stream) download(numTask int, contentStart, contentEnd int64) {
 		// 检查循环退出后是否成功
 		if task.Content == nil && task.Error == nil {
 			task.Error = fmt.Errorf("下载失败, 已达最大重试次数: %d", maxCount)
-			close(task.Done)
+			close(task.Content)
 			return
 		}
 	}
@@ -368,37 +367,27 @@ func (stream *Stream) download(numTask int, contentStart, contentEnd int64) {
 // clean 清理未完成或已读取的任务管道, 防止内存泄漏
 func (stream *Stream) clean() {
 	// 创建计时器, 避免死循环
-	timeout := time.NewTimer(5 * time.Second)
-	defer timeout.Stop()
+	waiter := time.NewTimer(5 * time.Second)
+	defer waiter.Stop()
 
 	for {
 		select {
 		case task := <-stream.Tasks:
 			if task != nil {
-				// 等待任务完成后再释放, 避免与下载协程产生 data race
-				// 使用 timer 替代 time.After 避免内存泄漏
-				taskTimer := time.NewTimer(5 * time.Second)
+				timer := time.NewTimer(5 * time.Second)
 				select {
-				case <-task.Done:
-					if !taskTimer.Stop() {
-						<-taskTimer.C
-					}
-				case <-taskTimer.C:
+				case <-task.Content:
+					timer.Stop()
+				case <-timer.C:
 					log.Printf("清理任务时遇到阻塞过长, 强制丢弃: start=%d end=%d", task.ContentStart, task.ContentEnd)
 				}
-				task.Content = nil
 				task = nil
 			}
 			// 重置计时器
-			if !timeout.Stop() {
-				<-timeout.C
-			}
-			timeout.Reset(5 * time.Second)
-		case <-timeout.C:
-			// 超时退出
+			waiter.Reset(5 * time.Second)
+		case <-waiter.C:
 			return
 		default:
-			// 任务队列已清空
 			return
 		}
 	}
@@ -456,9 +445,8 @@ func (task *Task) handleContent(content []byte, contentEnd int64) {
 		}
 		task.ContentEnd = contentEnd
 	}
-
-	task.Content = content
-	close(task.Done) // 唤醒等待此分片的协程
+	task.Content <- content
+	close(task.Content) // 唤醒等待此分片的协程
 }
 
 func (stream *Stream) handleCache(task *Task, cacheKey string, contentEnd int64) (found bool) {

@@ -229,9 +229,7 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 
 	// 9. 启动并发下载协程
 	go stream.start(start, end)
-	defer func() {
-		go stream.clean()
-	}() // 结束时清理
+	defer stream.clean() // 结束时清理
 
 	// 10. 循环从下载管道读取分片并写入 HTTP 响应体
 	if r.Method == http.MethodGet {
@@ -250,29 +248,34 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 					log.Printf("流式传输文件出错: cid=%d, mid=%d, name=%s, error=任务为空", cid, mid, fileName)
 					continue
 				}
+
+				if task.Error != nil {
+					log.Printf("切片下载出错: cid=%d, mid=%d, start=%d, end=%d, name=%s, error=%+v", cid, mid, task.ContentStart, task.ContentEnd, fileName, task.Error)
+					return
+				}
 				// 等待任务完成或者客户端断开
 				select {
 				case <-r.Context().Done():
 					log.Printf("流式传输文件已取消: cid=%d, mid=%d, name=%s", cid, mid, fileName)
 					return
-				case <-task.Done:
-					if task.Error != nil {
-						log.Printf("切片下载出错: cid=%d, mid=%d, start=%d, end=%d, name=%s, error=%+v", cid, mid, task.ContentStart, task.ContentEnd, fileName, task.Error)
+				case content, ok := <-task.Content:
+					if !ok {
+						log.Printf("流式传输文件已完成: cid=%d, mid=%d, name=%s", cid, mid, fileName)
 						return
 					}
 
 					// 写入响应
-					if _, err := w.Write(task.Content); err != nil {
-						log.Printf("写入文件流时出错: cid=%d, mid=%d, err=%v", cid, mid, err)
+					if _, err := w.Write(content); err != nil {
+						log.Printf("写入文件流时出错: cid=%d, mid=%d, name=%s, err=%v", cid, mid, fileName, err)
 						return
 					}
-
 					// 检查是否已经写完当前请求的所有范围
 					if task.ContentEnd >= end {
-						log.Printf("流式传输文件已完成: cid=%d, mid=%d", cid, mid)
+						log.Printf("流式传输文件已完成: cid=%d, mid=%d, name=%s", cid, mid, fileName)
 						return
 					}
 					task = nil
+					content = nil
 					timer.Reset(30 * time.Second)
 				}
 			case <-timer.C:
