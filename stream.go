@@ -381,11 +381,13 @@ func (stream *Stream) clean() {
 				case <-timer.C:
 					log.Printf("清理任务时遇到阻塞过长, 强制丢弃: start=%d end=%d", task.ContentStart, task.ContentEnd)
 				}
+				task.Content = nil
 				task = nil
 			}
 			// 重置计时器
 			waiter.Reset(5 * time.Second)
 		case <-waiter.C:
+			stream.Tasks = nil
 			return
 		default:
 			return
