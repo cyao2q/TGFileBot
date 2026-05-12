@@ -372,24 +372,27 @@ func (stream *Stream) clean() {
 
 	for {
 		select {
-		case task := <-stream.Tasks:
+		case task, ok := <-stream.Tasks:
+			if !ok {
+				task = nil
+				return
+			}
 			if task != nil {
 				timer := time.NewTimer(5 * time.Second)
 				select {
-				case <-task.Content:
+				case _, ok := <-task.Content:
+					if !ok {
+						task.Content = nil
+					}
 					timer.Stop()
 				case <-timer.C:
 					log.Printf("清理任务时遇到阻塞过长, 强制丢弃: start=%d end=%d", task.ContentStart, task.ContentEnd)
 				}
-				task.Content = nil
-				task = nil
 			}
 			// 重置计时器
 			waiter.Reset(5 * time.Second)
 		case <-waiter.C:
 			stream.Tasks = nil
-			return
-		default:
 			return
 		}
 	}
