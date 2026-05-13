@@ -130,6 +130,10 @@ func (infos *Infos) startBot() (err error) {
 				Description: "设置HTTP服务端口",
 			},
 			{
+				Command:     "proxy",
+				Description: "设置代理",
+			},
+			{
 				Command:     "check",
 				Description: "查找HASH对应的用户信息",
 			},
