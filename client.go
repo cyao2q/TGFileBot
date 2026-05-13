@@ -492,7 +492,7 @@ func (infos *Infos) submitPass(pass string) (err error) {
 
 // botConf 构造 Telegram 客户端所需的通用配置
 func botConf(cate string) (conf telegram.ClientConfig) {
-	return telegram.ClientConfig{
+	conf = telegram.ClientConfig{
 		AppID:        infos.Conf.AppID,
 		AppHash:      infos.Conf.AppHash,
 		LogLevel:     telegram.LogError,
@@ -522,4 +522,13 @@ func botConf(cate string) (conf telegram.ClientConfig) {
 			return true
 		},
 	}
+	if infos.Conf.Proxy != "" {
+		proxy, err := telegram.ProxyFromURL(infos.Conf.Proxy)
+		if err == nil {
+			conf.Proxy = proxy
+		} else {
+			log.Printf("代理地址解析失败: %v", err)
+		}
+	}	
+	return conf
 }
