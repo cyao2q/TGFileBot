@@ -105,7 +105,7 @@ docker run -d --name tgfilebot -p 8080:8080 -v $(pwd)/files:/root/files tgfilebo
 | `/code <验证码>`        | 提交手机验证码（需混入非数字字符，详见注意事项）  | 主管理员 |
 | `/pass <密码>`         | 提交账号的二次验证（2FA）密码           | 主管理员 |
 | `/password <key>`    | 设置当前账号的密码                  | 管理员  |
-| `/proxy <URL>`         | 设置代理 (支持 SOCKS、HTTP、MTProxy 和 TG 协议) | 管理员  |
+| `/proxy <URL>`         | 设置代理 (支持 SOCKS、HTTP、MTProxy 和 TG 协议, off 命令关闭代理) | 管理员  |
 | `/dc <ID>`           | 指定 UserBot 的DC             | 管理员  |
 | `/allow <ID>`        | 将特定用户 ID 添加到白名单            | 管理员  |
 | `/disallow <ID>`     | 从白名单中移除特定用户                | 管理员  |

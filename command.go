@@ -277,8 +277,13 @@ func handleBotCommand(m *telegram.NewMessage) error {
 			}
 			content := strings.TrimSpace(strings.TrimPrefix(text, "/proxy"))
 			if content == "" {
-				sendMS(m, fmt.Sprintf("当前代理: %s", infos.Conf.Proxy), nil, 60)
-				return nil
+				if infos.Conf.Proxy == "" {
+					sendMS(m, "当前未设置代理", nil, 60)
+					return nil
+				} else {
+					sendMS(m, fmt.Sprintf("当前代理: %s", infos.Conf.Proxy), nil, 60)
+					return nil
+				}
 			}
 			if content == "off" {
 				content = ""
